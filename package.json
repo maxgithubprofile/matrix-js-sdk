@@ -1,9 +1,9 @@
 {
     "name": "matrix-js-sdk-bastyon",
-    "version": "23.1.11",
+    "version": "23.2.1",
     "description": "Matrix Client-Server SDK for Javascript (Bastyon)",
     "engines": {
-        "node": ">=20.0.0"
+        "node": ">=18.0.0"
     },
     "scripts": {
         "prepack": "yarn build",
