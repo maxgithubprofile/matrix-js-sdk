@@ -31,6 +31,7 @@ import { RoomState } from "../../../src/models/room-state";
 import { GroupCallEventHandler, GroupCallEventHandlerEvent } from "../../../src/webrtc/groupCallEventHandler";
 import { flushPromises } from "../../test-utils/flushPromises";
 import { makeMockGroupCallStateEvent, MockCallMatrixClient } from "../../test-utils/webrtc";
+import { KnownMembership } from "../../../src/@types/membership";
 
 const FAKE_USER_ID = "@alice:test.dummy";
 const FAKE_DEVICE_ID = "AAAAAAA";
@@ -50,7 +51,7 @@ describe("Group Call Event Handler", function () {
 
         mockMember = {
             userId: FAKE_USER_ID,
-            membership: "join",
+            membership: KnownMembership.Join,
         } as unknown as RoomMember;
 
         const mockEvent = makeMockGroupCallStateEvent(FAKE_ROOM_ID, FAKE_GROUP_CALL_ID);
@@ -71,7 +72,8 @@ describe("Group Call Event Handler", function () {
             getMember: (userId: string) => (userId === FAKE_USER_ID ? mockMember : null),
         } as unknown as Room;
 
-        (mockClient as any).getRoom = jest.fn().mockReturnValue(mockRoom);
+        mockClient.getRoom = jest.fn().mockReturnValue(mockRoom);
+        mockClient.getFoci.mockReturnValue([{}]);
     });
 
     describe("reacts to state changes", () => {
@@ -95,6 +97,23 @@ describe("Group Call Event Handler", function () {
                     roomId: FAKE_ROOM_ID,
                 } as unknown as RoomState,
             );
+
+            expect(groupCall.state).toBe(GroupCallState.Ended);
+        });
+
+        it("terminates call when redacted", async () => {
+            await groupCallEventHandler.start();
+            mockClient.emitRoomState(makeMockGroupCallStateEvent(FAKE_ROOM_ID, FAKE_GROUP_CALL_ID), {
+                roomId: FAKE_ROOM_ID,
+            } as unknown as RoomState);
+
+            const groupCall = groupCallEventHandler.groupCalls.get(FAKE_ROOM_ID)!;
+
+            expect(groupCall.state).toBe(GroupCallState.LocalCallFeedUninitialized);
+
+            mockClient.emitRoomState(makeMockGroupCallStateEvent(FAKE_ROOM_ID, FAKE_GROUP_CALL_ID, undefined, true), {
+                roomId: FAKE_ROOM_ID,
+            } as unknown as RoomState);
 
             expect(groupCall.state).toBe(GroupCallState.Ended);
         });
@@ -222,9 +241,9 @@ describe("Group Call Event Handler", function () {
             jest.clearAllMocks();
         });
 
-        const setupCallAndStart = async (content?: IContent) => {
+        const setupCallAndStart = async (content?: IContent, redacted?: boolean) => {
             mocked(mockRoom.currentState.getStateEvents).mockReturnValue([
-                makeMockGroupCallStateEvent(FAKE_ROOM_ID, FAKE_GROUP_CALL_ID, content),
+                makeMockGroupCallStateEvent(FAKE_ROOM_ID, FAKE_GROUP_CALL_ID, content, redacted),
             ] as unknown as MatrixEvent);
             mockClient.getRooms.mockReturnValue([mockRoom]);
             await groupCallEventHandler.start();
@@ -277,6 +296,25 @@ describe("Group Call Event Handler", function () {
             mockClient.getRoom.mockReturnValue(undefined);
 
             await setupCallAndStart();
+
+            expect(mockClientEmit).not.toHaveBeenCalledWith(
+                GroupCallEventHandlerEvent.Incoming,
+                expect.objectContaining({
+                    groupCallId: FAKE_GROUP_CALL_ID,
+                }),
+            );
+        });
+
+        it("ignores redacted calls", async () => {
+            await setupCallAndStart(
+                {
+                    // Real event contents to make sure that it's specifically the
+                    // event being redacted that causes it to be ignored
+                    "m.type": GroupCallType.Video,
+                    "m.intent": GroupCallIntent.Prompt,
+                },
+                true,
+            );
 
             expect(mockClientEmit).not.toHaveBeenCalledWith(
                 GroupCallEventHandlerEvent.Incoming,

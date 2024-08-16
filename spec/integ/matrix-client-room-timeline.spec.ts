@@ -30,6 +30,7 @@ import {
     Room,
 } from "../../src";
 import { TestClient } from "../TestClient";
+import { KnownMembership } from "../../src/@types/membership";
 
 describe("MatrixClient room timelines", function () {
     const userId = "@alice:localhost";
@@ -42,7 +43,7 @@ describe("MatrixClient room timelines", function () {
 
     const USER_MEMBERSHIP_EVENT = utils.mkMembership({
         room: roomId,
-        mship: "join",
+        mship: KnownMembership.Join,
         user: userId,
         name: userName,
     });
@@ -76,7 +77,7 @@ describe("MatrixClient room timelines", function () {
                             ROOM_NAME_EVENT,
                             utils.mkMembership({
                                 room: roomId,
-                                mship: "join",
+                                mship: KnownMembership.Join,
                                 user: otherUserId,
                                 name: "Bob",
                             }),
@@ -85,9 +86,7 @@ describe("MatrixClient room timelines", function () {
                                 type: "m.room.create",
                                 room: roomId,
                                 user: userId,
-                                content: {
-                                    creator: userId,
-                                },
+                                content: {},
                             }),
                         ],
                     },
@@ -163,36 +162,38 @@ describe("MatrixClient room timelines", function () {
         it(
             "should be added immediately after calling MatrixClient.sendEvent " +
                 "with EventStatus.SENDING and the right event.sender",
-            function (done) {
-                client!.on(ClientEvent.Sync, function (state) {
-                    if (state !== "PREPARED") {
-                        return;
-                    }
-                    const room = client!.getRoom(roomId)!;
-                    expect(room.timeline.length).toEqual(1);
+            async () => {
+                const wasMessageAddedPromise = new Promise((resolve) => {
+                    client!.on(ClientEvent.Sync, async (state) => {
+                        if (state !== "PREPARED") {
+                            return;
+                        }
+                        const room = client!.getRoom(roomId)!;
+                        expect(room.timeline.length).toEqual(1);
 
-                    client!.sendTextMessage(roomId, "I am a fish", "txn1");
-                    // check it was added
-                    expect(room.timeline.length).toEqual(2);
-                    // check status
-                    expect(room.timeline[1].status).toEqual(EventStatus.SENDING);
-                    // check member
-                    const member = room.timeline[1].sender;
-                    expect(member?.userId).toEqual(userId);
-                    expect(member?.name).toEqual(userName);
+                        client!.sendTextMessage(roomId, "I am a fish", "txn1");
+                        // check it was added
+                        expect(room.timeline.length).toEqual(2);
+                        // check status
+                        expect(room.timeline[1].status).toEqual(EventStatus.SENDING);
+                        // check member
+                        const member = room.timeline[1].sender;
+                        expect(member?.userId).toEqual(userId);
+                        expect(member?.name).toEqual(userName);
 
-                    httpBackend!.flush("/sync", 1).then(function () {
-                        done();
+                        await httpBackend!.flush("/sync", 1);
+                        resolve(null);
                     });
                 });
-                httpBackend!.flush("/sync", 1);
+                await httpBackend!.flush("/sync", 1);
+                await wasMessageAddedPromise;
             },
         );
 
         it(
             "should be updated correctly when the send request finishes " +
                 "BEFORE the event comes down the event stream",
-            function (done) {
+            async () => {
                 const eventId = "$foo:bar";
                 httpBackend!.when("PUT", "/txn1").respond(200, {
                     event_id: eventId,
@@ -207,28 +208,30 @@ describe("MatrixClient room timelines", function () {
                 ev.unsigned = { transaction_id: "txn1" };
                 setNextSyncData([ev]);
 
-                client!.on(ClientEvent.Sync, function (state) {
-                    if (state !== "PREPARED") {
-                        return;
-                    }
-                    const room = client!.getRoom(roomId)!;
-                    client!.sendTextMessage(roomId, "I am a fish", "txn1").then(function () {
-                        expect(room.timeline[1].getId()).toEqual(eventId);
-                        httpBackend!.flush("/sync", 1).then(function () {
+                const wasMessageAddedPromise = new Promise((resolve) => {
+                    client!.on(ClientEvent.Sync, function (state) {
+                        if (state !== "PREPARED") {
+                            return;
+                        }
+                        const room = client!.getRoom(roomId)!;
+                        client!.sendTextMessage(roomId, "I am a fish", "txn1").then(async () => {
                             expect(room.timeline[1].getId()).toEqual(eventId);
-                            done();
+                            await httpBackend!.flush("/sync", 1);
+                            expect(room.timeline[1].getId()).toEqual(eventId);
+                            resolve(null);
                         });
+                        httpBackend!.flush("/txn1", 1);
                     });
-                    httpBackend!.flush("/txn1", 1);
                 });
-                httpBackend!.flush("/sync", 1);
+                await httpBackend!.flush("/sync", 1);
+                await wasMessageAddedPromise;
             },
         );
 
         it(
             "should be updated correctly when the send request finishes " +
                 "AFTER the event comes down the event stream",
-            function (done) {
+            async () => {
                 const eventId = "$foo:bar";
                 httpBackend!.when("PUT", "/txn1").respond(200, {
                     event_id: eventId,
@@ -243,23 +246,24 @@ describe("MatrixClient room timelines", function () {
                 ev.unsigned = { transaction_id: "txn1" };
                 setNextSyncData([ev]);
 
-                client!.on(ClientEvent.Sync, function (state) {
-                    if (state !== "PREPARED") {
-                        return;
-                    }
-                    const room = client!.getRoom(roomId)!;
-                    const promise = client!.sendTextMessage(roomId, "I am a fish", "txn1");
-                    httpBackend!.flush("/sync", 1).then(function () {
+                const wasMessageAddedPromise = new Promise((resolve) => {
+                    client!.on(ClientEvent.Sync, async (state) => {
+                        if (state !== "PREPARED") {
+                            return;
+                        }
+                        const room = client!.getRoom(roomId)!;
+                        const messageSendPromise = client!.sendTextMessage(roomId, "I am a fish", "txn1");
+                        await httpBackend!.flush("/sync", 1);
                         expect(room.timeline.length).toEqual(2);
                         httpBackend!.flush("/txn1", 1);
-                        promise.then(function () {
-                            expect(room.timeline.length).toEqual(2);
-                            expect(room.timeline[1].getId()).toEqual(eventId);
-                            done();
-                        });
+                        await messageSendPromise;
+                        expect(room.timeline.length).toEqual(2);
+                        expect(room.timeline[1].getId()).toEqual(eventId);
+                        resolve(null);
                     });
                 });
-                httpBackend!.flush("/sync", 1);
+                await httpBackend!.flush("/sync", 1);
+                await wasMessageAddedPromise;
             },
         );
     });
@@ -279,30 +283,29 @@ describe("MatrixClient room timelines", function () {
             });
         });
 
-        it("should set Room.oldState.paginationToken to null at the start" + " of the timeline.", function (done) {
-            client!.on(ClientEvent.Sync, function (state) {
-                if (state !== "PREPARED") {
-                    return;
-                }
-                const room = client!.getRoom(roomId)!;
-                expect(room.timeline.length).toEqual(1);
+        it("should set Room.oldState.paginationToken to null at the start of the timeline.", async () => {
+            const didPaginatePromise = new Promise((resolve) => {
+                client!.on(ClientEvent.Sync, async (state) => {
+                    if (state !== "PREPARED") {
+                        return;
+                    }
+                    const room = client!.getRoom(roomId)!;
+                    expect(room.timeline.length).toEqual(1);
 
-                client!.scrollback(room).then(function () {
+                    await Promise.all([client!.scrollback(room), httpBackend!.flush("/messages", 1)]);
                     expect(room.timeline.length).toEqual(1);
                     expect(room.oldState.paginationToken).toBe(null);
 
                     // still have a sync to flush
-                    httpBackend!.flush("/sync", 1).then(() => {
-                        done();
-                    });
+                    await httpBackend!.flush("/sync", 1);
+                    resolve(null);
                 });
-
-                httpBackend!.flush("/messages", 1);
             });
-            httpBackend!.flush("/sync", 1);
+            await httpBackend!.flush("/sync", 1);
+            await didPaginatePromise;
         });
 
-        it("should set the right event.sender values", function (done) {
+        it("should set the right event.sender values", async () => {
             // We're aiming for an eventual timeline of:
             //
             // 'Old Alice' joined the room
@@ -314,7 +317,7 @@ describe("MatrixClient room timelines", function () {
 
             // make an m.room.member event for alice's join
             const joinMshipEvent = utils.mkMembership({
-                mship: "join",
+                mship: KnownMembership.Join,
                 user: userId,
                 room: roomId,
                 name: "Old Alice",
@@ -324,16 +327,16 @@ describe("MatrixClient room timelines", function () {
             // make an m.room.member event with prev_content for alice's nick
             // change
             const oldMshipEvent = utils.mkMembership({
-                mship: "join",
+                mship: KnownMembership.Join,
                 user: userId,
                 room: roomId,
                 name: userName,
                 url: "mxc://some/url",
             });
-            oldMshipEvent.prev_content = {
+            oldMshipEvent.unsigned!.prev_content = {
                 displayname: "Old Alice",
                 avatar_url: undefined,
-                membership: "join",
+                membership: KnownMembership.Join,
             };
 
             // set the list of events to return on scrollback (/messages)
@@ -353,15 +356,17 @@ describe("MatrixClient room timelines", function () {
                 joinMshipEvent,
             ];
 
-            client!.on(ClientEvent.Sync, function (state) {
-                if (state !== "PREPARED") {
-                    return;
-                }
-                const room = client!.getRoom(roomId)!;
-                // sync response
-                expect(room.timeline.length).toEqual(1);
+            const didPaginatePromise = new Promise((resolve) => {
+                client!.on(ClientEvent.Sync, async (state) => {
+                    if (state !== "PREPARED") {
+                        return;
+                    }
+                    const room = client!.getRoom(roomId)!;
+                    // sync response
+                    expect(room.timeline.length).toEqual(1);
 
-                client!.scrollback(room).then(function () {
+                    await Promise.all([client!.scrollback(room), httpBackend!.flush("/messages", 1)]);
+
                     expect(room.timeline.length).toEqual(5);
                     const joinMsg = room.timeline[0];
                     expect(joinMsg.sender?.name).toEqual("Old Alice");
@@ -371,17 +376,15 @@ describe("MatrixClient room timelines", function () {
                     expect(newMsg.sender?.name).toEqual(userName);
 
                     // still have a sync to flush
-                    httpBackend!.flush("/sync", 1).then(() => {
-                        done();
-                    });
+                    await httpBackend!.flush("/sync", 1);
+                    resolve(null);
                 });
-
-                httpBackend!.flush("/messages", 1);
             });
-            httpBackend!.flush("/sync", 1);
+            await httpBackend!.flush("/sync", 1);
+            await didPaginatePromise;
         });
 
-        it("should add it them to the right place in the timeline", function (done) {
+        it("should add it them to the right place in the timeline", async () => {
             // set the list of events to return on scrollback
             sbEvents = [
                 utils.mkMessage({
@@ -396,30 +399,30 @@ describe("MatrixClient room timelines", function () {
                 }),
             ];
 
-            client!.on(ClientEvent.Sync, function (state) {
-                if (state !== "PREPARED") {
-                    return;
-                }
-                const room = client!.getRoom(roomId)!;
-                expect(room.timeline.length).toEqual(1);
+            const didPaginatePromise = new Promise((resolve) => {
+                client!.on(ClientEvent.Sync, async (state) => {
+                    if (state !== "PREPARED") {
+                        return;
+                    }
+                    const room = client!.getRoom(roomId)!;
+                    expect(room.timeline.length).toEqual(1);
 
-                client!.scrollback(room).then(function () {
+                    await Promise.all([client!.scrollback(room), httpBackend!.flush("/messages", 1)]);
+
                     expect(room.timeline.length).toEqual(3);
                     expect(room.timeline[0].event).toEqual(sbEvents[1]);
                     expect(room.timeline[1].event).toEqual(sbEvents[0]);
 
                     // still have a sync to flush
-                    httpBackend!.flush("/sync", 1).then(() => {
-                        done();
-                    });
+                    await httpBackend!.flush("/sync", 1);
+                    resolve(null);
                 });
-
-                httpBackend!.flush("/messages", 1);
             });
-            httpBackend!.flush("/sync", 1);
+            await httpBackend!.flush("/sync", 1);
+            await didPaginatePromise;
         });
 
-        it("should use 'end' as the next pagination token", function (done) {
+        it("should use 'end' as the next pagination token", async () => {
             // set the list of events to return on scrollback
             sbEvents = [
                 utils.mkMessage({
@@ -429,25 +432,24 @@ describe("MatrixClient room timelines", function () {
                 }),
             ];
 
-            client!.on(ClientEvent.Sync, function (state) {
-                if (state !== "PREPARED") {
-                    return;
-                }
-                const room = client!.getRoom(roomId)!;
-                expect(room.oldState.paginationToken).toBeTruthy();
+            const didPaginatePromise = new Promise((resolve) => {
+                client!.on(ClientEvent.Sync, async (state) => {
+                    if (state !== "PREPARED") {
+                        return;
+                    }
+                    const room = client!.getRoom(roomId)!;
+                    expect(room.oldState.paginationToken).toBeTruthy();
 
-                client!.scrollback(room, 1).then(function () {
+                    await Promise.all([client!.scrollback(room, 1), httpBackend!.flush("/messages", 1)]);
                     expect(room.oldState.paginationToken).toEqual(sbEndTok);
-                });
 
-                httpBackend!.flush("/messages", 1).then(function () {
                     // still have a sync to flush
-                    httpBackend!.flush("/sync", 1).then(() => {
-                        done();
-                    });
+                    await httpBackend!.flush("/sync", 1);
+                    resolve(null);
                 });
             });
-            httpBackend!.flush("/sync", 1);
+            await httpBackend!.flush("/sync", 1);
+            await didPaginatePromise;
         });
     });
 
@@ -486,7 +488,7 @@ describe("MatrixClient room timelines", function () {
                 utils.mkMembership({
                     user: userId,
                     room: roomId,
-                    mship: "join",
+                    mship: KnownMembership.Join,
                     name: "New Name",
                 }),
                 utils.mkMessage({ user: userId, room: roomId }),
@@ -553,13 +555,13 @@ describe("MatrixClient room timelines", function () {
                 utils.mkMembership({
                     user: userC,
                     room: roomId,
-                    mship: "join",
+                    mship: KnownMembership.Join,
                     name: "C",
                 }),
                 utils.mkMembership({
                     user: userC,
                     room: roomId,
-                    mship: "invite",
+                    mship: KnownMembership.Invite,
                     skey: userD,
                 }),
             ];
@@ -570,9 +572,9 @@ describe("MatrixClient room timelines", function () {
                 return Promise.all([httpBackend!.flush("/sync", 1), utils.syncPromise(client!)]).then(function () {
                     expect(room.currentState.getMembers().length).toEqual(4);
                     expect(room.currentState.getMember(userC)!.name).toEqual("C");
-                    expect(room.currentState.getMember(userC)!.membership).toEqual("join");
+                    expect(room.currentState.getMember(userC)!.membership).toEqual(KnownMembership.Join);
                     expect(room.currentState.getMember(userD)!.name).toEqual(userD);
-                    expect(room.currentState.getMember(userD)!.membership).toEqual("invite");
+                    expect(room.currentState.getMember(userD)!.membership).toEqual(KnownMembership.Invite);
                 });
             });
         });
@@ -597,9 +599,9 @@ describe("MatrixClient room timelines", function () {
                     expect(room.timeline[0].event).toEqual(eventData[0]);
                     expect(room.currentState.getMembers().length).toEqual(2);
                     expect(room.currentState.getMember(userId)!.name).toEqual(userName);
-                    expect(room.currentState.getMember(userId)!.membership).toEqual("join");
+                    expect(room.currentState.getMember(userId)!.membership).toEqual(KnownMembership.Join);
                     expect(room.currentState.getMember(otherUserId)!.name).toEqual("Bob");
-                    expect(room.currentState.getMember(otherUserId)!.membership).toEqual("join");
+                    expect(room.currentState.getMember(otherUserId)!.membership).toEqual(KnownMembership.Join);
                 });
             });
         });

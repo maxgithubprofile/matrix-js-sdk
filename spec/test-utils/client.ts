@@ -60,6 +60,7 @@ export const getMockClientWithEventEmitter = (
  */
 export const mockClientMethodsUser = (userId = "@alice:domain") => ({
     getUserId: jest.fn().mockReturnValue(userId),
+    getSafeUserId: jest.fn().mockReturnValue(userId),
     getUser: jest.fn().mockReturnValue(new User(userId)),
     isGuest: jest.fn().mockReturnValue(false),
     mxcUrlToHttp: jest.fn().mockReturnValue("mock-mxcUrlToHttp"),
@@ -85,9 +86,8 @@ export const mockClientMethodsEvents = () => ({
  * Returns basic mocked client methods related to server support
  */
 export const mockClientMethodsServer = (): Partial<Record<MethodLikeKeys<MatrixClient>, unknown>> => ({
-    doesServerSupportSeparateAddAndBind: jest.fn(),
     getIdentityServerUrl: jest.fn(),
     getHomeserverUrl: jest.fn(),
-    getCapabilities: jest.fn().mockReturnValue({}),
+    getCachedCapabilities: jest.fn().mockReturnValue({}),
     doesServerSupportUnstableFeature: jest.fn().mockResolvedValue(false),
 });

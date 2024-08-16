@@ -17,7 +17,7 @@ limitations under the License.
 import type { SyncCryptoCallbacks } from "./common-crypto/CryptoBackend";
 import { NotificationCountType, Room, RoomEvent } from "./models/room";
 import { logger } from "./logger";
-import * as utils from "./utils";
+import { promiseMapSeries } from "./utils";
 import { EventTimeline } from "./models/event-timeline";
 import { ClientEvent, IStoredClientOpts, MatrixClient } from "./client";
 import {
@@ -27,6 +27,7 @@ import {
     SyncApiOptions,
     defaultClientOpts,
     defaultSyncApiOpts,
+    SetPresence,
 } from "./sync";
 import { MatrixEvent } from "./models/event";
 import { Crypto } from "./crypto";
@@ -43,9 +44,9 @@ import {
 } from "./sliding-sync";
 import { EventType } from "./@types/event";
 import { IPushRules } from "./@types/PushRules";
-import { PushProcessor } from "./pushprocessor";
 import { RoomStateEvent } from "./models/room-state";
 import { RoomMemberEvent } from "./models/room-member";
+import { KnownMembership } from "./@types/membership";
 
 // Number of consecutive failed syncs that will lead to a syncState of ERROR as opposed
 // to RECONNECTING. This is needed to inform the client of server issues when the
@@ -86,30 +87,16 @@ class ExtensionE2EE implements Extension<ExtensionE2EERequest, ExtensionE2EEResp
 
     public async onResponse(data: ExtensionE2EEResponse): Promise<void> {
         // Handle device list updates
-        if (data["device_lists"]) {
-            await this.crypto.handleDeviceListChanges(
-                {
-                    oldSyncToken: "yep", // XXX need to do this so the device list changes get processed :(
-                },
-                data["device_lists"],
-            );
+        if (data.device_lists) {
+            await this.crypto.processDeviceLists(data.device_lists);
         }
 
-        // Handle one_time_keys_count
-        if (data["device_one_time_keys_count"]) {
-            const currentCount = data["device_one_time_keys_count"].signed_curve25519 || 0;
-            this.crypto.updateOneTimeKeyCount(currentCount);
-        }
-        if (data["device_unused_fallback_key_types"] || data["org.matrix.msc2732.device_unused_fallback_key_types"]) {
-            // The presence of device_unused_fallback_key_types indicates that the
-            // server supports fallback keys. If there's no unused
-            // signed_curve25519 fallback key we need a new one.
-            const unusedFallbackKeys =
-                data["device_unused_fallback_key_types"] || data["org.matrix.msc2732.device_unused_fallback_key_types"];
-            this.crypto.setNeedsNewFallback(
-                Array.isArray(unusedFallbackKeys) && !unusedFallbackKeys.includes("signed_curve25519"),
-            );
-        }
+        // Handle one_time_keys_count and unused_fallback_key_types
+        await this.crypto.processKeyCounts(
+            data.device_one_time_keys_count,
+            data["device_unused_fallback_key_types"] || data["org.matrix.msc2732.device_unused_fallback_key_types"],
+        );
+
         this.crypto.onSyncCompleted({});
     }
 }
@@ -128,7 +115,10 @@ type ExtensionToDeviceResponse = {
 class ExtensionToDevice implements Extension<ExtensionToDeviceRequest, ExtensionToDeviceResponse> {
     private nextBatch: string | null = null;
 
-    public constructor(private readonly client: MatrixClient, private readonly cryptoCallbacks?: SyncCryptoCallbacks) {}
+    public constructor(
+        private readonly client: MatrixClient,
+        private readonly cryptoCallbacks?: SyncCryptoCallbacks,
+    ) {}
 
     public name(): string {
         return "to_device";
@@ -229,7 +219,7 @@ class ExtensionAccountData implements Extension<ExtensionAccountDataRequest, Ext
         };
     }
 
-    public onResponse(data: ExtensionAccountDataResponse): void {
+    public async onResponse(data: ExtensionAccountDataResponse): Promise<void> {
         if (data.global && data.global.length > 0) {
             this.processGlobalAccountData(data.global);
         }
@@ -262,7 +252,7 @@ class ExtensionAccountData implements Extension<ExtensionAccountDataRequest, Ext
             // (see sync) before syncing over the network.
             if (accountDataEvent.getType() === EventType.PushRules) {
                 const rules = accountDataEvent.getContent<IPushRules>();
-                this.client.pushRules = PushProcessor.rewriteDefaultRules(rules);
+                this.client.setPushRules(rules);
             }
             const prevEvent = prevEventsMap[accountDataEvent.getType()];
             this.client.emit(ClientEvent.AccountData, accountDataEvent, prevEvent);
@@ -299,7 +289,7 @@ class ExtensionTyping implements Extension<ExtensionTypingRequest, ExtensionTypi
         };
     }
 
-    public onResponse(data: ExtensionTypingResponse): void {
+    public async onResponse(data: ExtensionTypingResponse): Promise<void> {
         if (!data?.rooms) {
             return;
         }
@@ -338,7 +328,7 @@ class ExtensionReceipts implements Extension<ExtensionReceiptsRequest, Extension
         return undefined; // don't send a JSON object for subsequent requests, we don't need to.
     }
 
-    public onResponse(data: ExtensionReceiptsResponse): void {
+    public async onResponse(data: ExtensionReceiptsResponse): Promise<void> {
         if (!data?.rooms) {
             return;
         }
@@ -391,7 +381,7 @@ export class SlidingSyncSdk {
         });
     }
 
-    private onRoomData(roomId: string, roomData: MSC3575RoomData): void {
+    private async onRoomData(roomId: string, roomData: MSC3575RoomData): Promise<void> {
         let room = this.client.store.getRoom(roomId);
         if (!room) {
             if (!roomData.initial) {
@@ -400,7 +390,7 @@ export class SlidingSyncSdk {
             }
             room = _createAndReEmitRoom(this.client, roomId, this.opts);
         }
-        this.processRoomData(this.client, room, roomData);
+        await this.processRoomData(this.client, room!, roomData);
     }
 
     private onLifecycle(state: SlidingSyncState, resp: MSC3575SlidingSyncResponse | null, err?: Error): void {
@@ -466,7 +456,7 @@ export class SlidingSyncSdk {
      * @returns A promise which resolves once the room has been added to the
      * store.
      */
-    public async peek(_roomId: string): Promise<Room> {
+    public async peek(roomId: string): Promise<Room> {
         return null!; // TODO
     }
 
@@ -476,6 +466,14 @@ export class SlidingSyncSdk {
      */
     public stopPeeking(): void {
         // TODO
+    }
+
+    /**
+     * Specify the set_presence value to be used for subsequent calls to the Sync API.
+     * @param presence - the presence to specify to set_presence of sync calls
+     */
+    public setPresence(presence?: SetPresence): void {
+        // TODO not possible in sliding sync yet
     }
 
     /**
@@ -618,7 +616,7 @@ export class SlidingSyncSdk {
             }
         }
 
-        const encrypted = this.client.isRoomEncrypted(room.roomId);
+        const encrypted = room.hasEncryptionStateEvent();
         // we do this first so it's correct when any of the events fire
         if (roomData.notification_count != null) {
             room.setUnreadNotificationCount(NotificationCountType.Total, roomData.notification_count);
@@ -643,7 +641,7 @@ export class SlidingSyncSdk {
 
         if (roomData.invite_state) {
             const inviteStateEvents = mapEvents(this.client, room.roomId, roomData.invite_state);
-            this.injectRoomEvents(room, inviteStateEvents);
+            await this.injectRoomEvents(room, inviteStateEvents);
             if (roomData.initial) {
                 room.recalculate();
                 this.client.store.storeRoom(room);
@@ -652,7 +650,7 @@ export class SlidingSyncSdk {
             inviteStateEvents.forEach((e) => {
                 this.client.emit(ClientEvent.Event, e);
             });
-            room.updateMyMembership("invite");
+            room.updateMyMembership(KnownMembership.Invite);
             return;
         }
 
@@ -715,14 +713,14 @@ export class SlidingSyncSdk {
             }
         } */
 
-        this.injectRoomEvents(room, stateEvents, timelineEvents, roomData.num_live);
+        await this.injectRoomEvents(room, stateEvents, timelineEvents, roomData.num_live);
 
         // we deliberately don't add ephemeral events to the timeline
         room.addEphemeralEvents(ephemeralEvents);
 
         // local fields must be set before any async calls because call site assumes
         // synchronous execution prior to emitting SlidingSyncState.Complete
-        room.updateMyMembership("join");
+        room.updateMyMembership(KnownMembership.Join);
 
         room.recalculate();
         if (roomData.initial) {
@@ -736,13 +734,13 @@ export class SlidingSyncSdk {
 
         const processRoomEvent = async (e: MatrixEvent): Promise<void> => {
             client.emit(ClientEvent.Event, e);
-            if (e.isState() && e.getType() == EventType.RoomEncryption && this.syncOpts.crypto) {
-                await this.syncOpts.crypto.onCryptoEvent(room, e);
+            if (e.isState() && e.getType() == EventType.RoomEncryption && this.syncOpts.cryptoCallbacks) {
+                await this.syncOpts.cryptoCallbacks.onCryptoEvent(room, e);
             }
         };
 
-        await utils.promiseMapSeries(stateEvents, processRoomEvent);
-        await utils.promiseMapSeries(timelineEvents, processRoomEvent);
+        await promiseMapSeries(stateEvents, processRoomEvent);
+        await promiseMapSeries(timelineEvents, processRoomEvent);
         ephemeralEvents.forEach(function (e) {
             client.emit(ClientEvent.Event, e);
         });
@@ -762,12 +760,12 @@ export class SlidingSyncSdk {
      * @param numLive - the number of events in timelineEventList which just happened,
      * supplied from the server.
      */
-    public injectRoomEvents(
+    public async injectRoomEvents(
         room: Room,
         stateEventList: MatrixEvent[],
         timelineEventList?: MatrixEvent[],
         numLive?: number,
-    ): void {
+    ): Promise<void> {
         timelineEventList = timelineEventList || [];
         stateEventList = stateEventList || [];
         numLive = numLive || 0;
@@ -826,11 +824,11 @@ export class SlidingSyncSdk {
         // if the timeline has any state events in it.
         // This also needs to be done before running push rules on the events as they need
         // to be decorated with sender etc.
-        room.addLiveEvents(timelineEventList, {
+        await room.addLiveEvents(timelineEventList, {
             fromCache: true,
         });
         if (liveTimelineEvents.length > 0) {
-            room.addLiveEvents(liveTimelineEvents, {
+            await room.addLiveEvents(liveTimelineEvents, {
                 fromCache: false,
             });
         }
@@ -848,7 +846,7 @@ export class SlidingSyncSdk {
         const client = this.client;
         // For each invited room member we want to give them a displayname/avatar url
         // if they have one (the m.room.member invites don't contain this).
-        room.getMembersWithMembership("invite").forEach(function (member) {
+        room.getMembersWithMembership(KnownMembership.Invite).forEach(function (member) {
             if (member.requestedProfileInfo) return;
             member.requestedProfileInfo = true;
             // try to get a cached copy first.
@@ -868,7 +866,7 @@ export class SlidingSyncSdk {
                     // the code paths remain the same between invite/join display name stuff
                     // which is a worthy trade-off for some minor pollution.
                     const inviteEvent = member.events.member!;
-                    if (inviteEvent.getContent().membership !== "invite") {
+                    if (inviteEvent.getContent().membership !== KnownMembership.Invite) {
                         // between resolving and now they have since joined, so don't clobber
                         return;
                     }

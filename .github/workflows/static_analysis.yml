@@ -1,6 +1,8 @@
 name: Static Analysis
 on:
     pull_request: {}
+    merge_group:
+        types: [checks_requested]
     push:
         branches: [develop, master]
 concurrency:
@@ -11,11 +13,12 @@ jobs:
         name: "Typescript Syntax Check"
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v3
+            - uses: actions/checkout@v4
 
-            - uses: actions/setup-node@v3
+            - uses: actions/setup-node@v4
               with:
                   cache: "yarn"
+                  node-version-file: package.json
 
             - name: Install Deps
               run: "yarn install"
@@ -37,11 +40,12 @@ jobs:
         name: "ESLint"
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v3
+            - uses: actions/checkout@v4
 
-            - uses: actions/setup-node@v3
+            - uses: actions/setup-node@v4
               with:
                   cache: "yarn"
+                  node-version-file: package.json
 
             - name: Install Deps
               run: "yarn install"
@@ -49,26 +53,61 @@ jobs:
             - name: Run Linter
               run: "yarn run lint:js"
 
+    workflow_lint:
+        name: "Workflow Lint"
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  cache: "yarn"
+                  node-version-file: package.json
+
+            - name: Install Deps
+              run: "yarn install --frozen-lockfile"
+
+            - name: Run Linter
+              run: "yarn lint:workflows"
+
     docs:
         name: "JSDoc Checker"
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v3
+            - uses: actions/checkout@v4
 
-            - uses: actions/setup-node@v3
+            - uses: actions/setup-node@v4
               with:
                   cache: "yarn"
+                  node-version-file: package.json
 
             - name: Install Deps
               run: "yarn install"
 
             - name: Generate Docs
-              run: "yarn run gendoc"
+              run: "yarn run gendoc --treatWarningsAsErrors --suppressCommentWarningsInDeclarationFiles"
 
             - name: Upload Artifact
-              uses: actions/upload-artifact@v3
+              uses: actions/upload-artifact@v4
               with:
                   name: docs
                   path: _docs
                   # We'll only use this in a workflow_run, then we're done with it
                   retention-days: 1
+
+    analyse_dead_code:
+        name: "Analyse Dead Code"
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  cache: "yarn"
+                  node-version-file: package.json
+
+            - name: Install Deps
+              run: "yarn install --frozen-lockfile"
+
+            - name: Run linter
+              run: "yarn run lint:knip"

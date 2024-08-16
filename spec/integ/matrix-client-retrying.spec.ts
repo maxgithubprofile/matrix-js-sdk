@@ -16,7 +16,7 @@ limitations under the License.
 
 import HttpBackend from "matrix-mock-request";
 
-import { EventStatus, RoomEvent, MatrixClient, MatrixScheduler } from "../../src/matrix";
+import { EventStatus, MatrixClient, MatrixScheduler, MsgType, RoomEvent } from "../../src/matrix";
 import { Room } from "../../src/models/room";
 import { TestClient } from "../TestClient";
 
@@ -48,19 +48,19 @@ describe("MatrixClient retrying", function () {
         return httpBackend!.stop();
     });
 
-    xit("should retry according to MatrixScheduler.retryFn", function () {});
+    it.skip("should retry according to MatrixScheduler.retryFn", function () {});
 
-    xit("should queue according to MatrixScheduler.queueFn", function () {});
+    it.skip("should queue according to MatrixScheduler.queueFn", function () {});
 
-    xit("should mark events as EventStatus.NOT_SENT when giving up", function () {});
+    it.skip("should mark events as EventStatus.NOT_SENT when giving up", function () {});
 
-    xit("should mark events as EventStatus.QUEUED when queued", function () {});
+    it.skip("should mark events as EventStatus.QUEUED when queued", function () {});
 
     it("should mark events as EventStatus.CANCELLED when cancelled", function () {
         // send a couple of events; the second will be queued
         const p1 = client!
             .sendMessage(roomId, {
-                msgtype: "m.text",
+                msgtype: MsgType.Text,
                 body: "m1",
             })
             .then(
@@ -77,7 +77,7 @@ describe("MatrixClient retrying", function () {
         // never gets resolved.
         // https://github.com/matrix-org/matrix-js-sdk/issues/496
         client!.sendMessage(roomId, {
-            msgtype: "m.text",
+            msgtype: MsgType.Text,
             body: "m2",
         });
 
@@ -130,7 +130,7 @@ describe("MatrixClient retrying", function () {
     });
 
     describe("resending", function () {
-        xit("should be able to resend a NOT_SENT event", function () {});
-        xit("should be able to resend a sent event", function () {});
+        it.skip("should be able to resend a NOT_SENT event", function () {});
+        it.skip("should be able to resend a sent event", function () {});
     });
 });

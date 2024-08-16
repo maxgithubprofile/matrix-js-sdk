@@ -25,6 +25,8 @@ import {
 } from "../../../src/models/MSC3089TreeSpace";
 import { DEFAULT_ALPHABET } from "../../../src/utils";
 import { MatrixError } from "../../../src/http-api";
+import { KnownMembership } from "../../../src/@types/membership";
+import { EncryptedFile } from "../../../src/@types/media";
 
 describe("MSC3089TreeSpace", () => {
     let client: MatrixClient;
@@ -130,14 +132,8 @@ describe("MSC3089TreeSpace", () => {
             return Promise.reject(new MatrixError({ errcode: "M_FORBIDDEN", error: "Sample Failure" }));
         });
         client.invite = fn;
-        try {
-            await tree.invite(target, false, false);
 
-            // noinspection ExceptionCaughtLocallyJS
-            throw new Error("Failed to fail");
-        } catch (e) {
-            expect((<MatrixError>e).errcode).toEqual("M_FORBIDDEN");
-        }
+        await expect(tree.invite(target, false, false)).rejects.toThrow("MatrixError: Sample Failure");
 
         expect(fn).toHaveBeenCalledTimes(1);
     });
@@ -357,13 +353,18 @@ describe("MSC3089TreeSpace", () => {
             .fn()
             .mockImplementation(async (roomId: string, eventType: EventType, content: any, stateKey: string) => {
                 expect([tree.roomId, subspaceId]).toContain(roomId);
+
+                let expectedType: string;
+                let expectedStateKey: string;
                 if (roomId === subspaceId) {
-                    expect(eventType).toEqual(EventType.SpaceParent);
-                    expect(stateKey).toEqual(tree.roomId);
+                    expectedType = EventType.SpaceParent;
+                    expectedStateKey = tree.roomId;
                 } else {
-                    expect(eventType).toEqual(EventType.SpaceChild);
-                    expect(stateKey).toEqual(subspaceId);
+                    expectedType = EventType.SpaceChild;
+                    expectedStateKey = subspaceId;
                 }
+                expect(eventType).toEqual(expectedType);
+                expect(stateKey).toEqual(expectedStateKey);
                 expect(content).toMatchObject({ via: [domain] });
 
                 // return value not used
@@ -400,7 +401,7 @@ describe("MSC3089TreeSpace", () => {
                 ];
             },
         };
-        client.getRoom = () => ({} as Room); // to appease the TreeSpace constructor
+        client.getRoom = () => ({}) as Room; // to appease the TreeSpace constructor
 
         const getFn = jest.fn().mockImplementation((roomId: string) => {
             if (roomId === thirdChildRoom) {
@@ -423,7 +424,7 @@ describe("MSC3089TreeSpace", () => {
     });
 
     it("should find specific directories", () => {
-        client.getRoom = () => ({} as Room); // to appease the TreeSpace constructor
+        client.getRoom = () => ({}) as Room; // to appease the TreeSpace constructor
 
         // Only mocking used API
         const firstSubdirectory = { roomId: "!first:example.org" } as any as MSC3089TreeSpace;
@@ -459,14 +460,14 @@ describe("MSC3089TreeSpace", () => {
                 expect(stateKey).toBeUndefined();
                 return [
                     // Partial implementations
-                    { getContent: () => ({ membership: "join" }), getStateKey: () => joinMemberId },
-                    { getContent: () => ({ membership: "knock" }), getStateKey: () => knockMemberId },
-                    { getContent: () => ({ membership: "invite" }), getStateKey: () => inviteMemberId },
-                    { getContent: () => ({ membership: "leave" }), getStateKey: () => leaveMemberId },
-                    { getContent: () => ({ membership: "ban" }), getStateKey: () => banMemberId },
+                    { getContent: () => ({ membership: KnownMembership.Join }), getStateKey: () => joinMemberId },
+                    { getContent: () => ({ membership: KnownMembership.Knock }), getStateKey: () => knockMemberId },
+                    { getContent: () => ({ membership: KnownMembership.Invite }), getStateKey: () => inviteMemberId },
+                    { getContent: () => ({ membership: KnownMembership.Leave }), getStateKey: () => leaveMemberId },
+                    { getContent: () => ({ membership: KnownMembership.Ban }), getStateKey: () => banMemberId },
 
                     // ensure we don't kick ourselves
-                    { getContent: () => ({ membership: "join" }), getStateKey: () => selfUserId },
+                    { getContent: () => ({ membership: KnownMembership.Join }), getStateKey: () => selfUserId },
                 ];
             },
         };
@@ -629,15 +630,8 @@ describe("MSC3089TreeSpace", () => {
         });
 
         it("should throw when setting an order at the top level space", async () => {
-            try {
-                // The tree is what we've defined as top level, so it should work
-                await tree.setOrder(2);
-
-                // noinspection ExceptionCaughtLocallyJS
-                throw new Error("Failed to fail");
-            } catch (e) {
-                expect((<Error>e).message).toEqual("Cannot set order of top level spaces currently");
-            }
+            // The tree is what we've defined as top level, so it should work
+            await expect(tree.setOrder(2)).rejects.toThrow("Cannot set order of top level spaces currently");
         });
 
         it("should return a stable order for unordered children", () => {
@@ -954,7 +948,7 @@ describe("MSC3089TreeSpace", () => {
         const fileInfo = {
             mimetype: "text/plain",
             // other fields as required by encryption, but ignored here
-        };
+        } as unknown as EncryptedFile;
         const fileEventId = "$file";
         const fileName = "My File.txt";
         const fileContents = "This is a test file";
@@ -1014,7 +1008,7 @@ describe("MSC3089TreeSpace", () => {
         const fileInfo = {
             mimetype: "text/plain",
             // other fields as required by encryption, but ignored here
-        };
+        } as unknown as EncryptedFile;
         const fileEventId = "$file";
         const fileName = "My File.txt";
         const fileContents = "This is a test file";

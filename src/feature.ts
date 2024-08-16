@@ -25,9 +25,15 @@ export enum ServerSupport {
 export enum Feature {
     Thread = "Thread",
     ThreadUnreadNotifications = "ThreadUnreadNotifications",
+    /**
+     * @deprecated this is now exposed as a capability not a feature
+     */
     LoginTokenRequest = "LoginTokenRequest",
     RelationBasedRedactions = "RelationBasedRedactions",
     AccountDataDeletion = "AccountDataDeletion",
+    RelationsRecursion = "RelationsRecursion",
+    IntentionalMentions = "IntentionalMentions",
+    MigrateServerNameToVia = "MigrateServerNameToVia",
 }
 
 type FeatureSupportCondition = {
@@ -52,6 +58,16 @@ const featureSupportResolver: Record<string, FeatureSupportCondition> = {
     },
     [Feature.AccountDataDeletion]: {
         unstablePrefixes: ["org.matrix.msc3391"],
+    },
+    [Feature.RelationsRecursion]: {
+        unstablePrefixes: ["org.matrix.msc3981"],
+    },
+    [Feature.IntentionalMentions]: {
+        unstablePrefixes: ["org.matrix.msc3952_intentional_mentions"],
+        matrixVersion: "v1.7",
+    },
+    [Feature.MigrateServerNameToVia]: {
+        unstablePrefixes: ["org.matrix.msc4156"],
     },
 };
 
