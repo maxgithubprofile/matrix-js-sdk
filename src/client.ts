@@ -4101,7 +4101,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     public setRoomRetention(roomId: string, content: Record<string, any>): Promise<{}> {
         const path = utils.encodeUri("/rooms/$roomId/state/$type", {
             $roomId: roomId,
-            $type: 'm.room.retention',
+            $type: "m.room.retention",
         });
         return this.http.authedRequest(Method.Put, path, undefined, content);
     }
@@ -6849,9 +6849,25 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             logger.debug("TURN creds are valid for another " + remainingTime + " ms: not fetching new ones.");
             credentialsGood = true;
         } else {
-            const getList1=():ITurnServer[]=>{const list=["rel"+"ay2.expresstu"+"rn.com:443","rel"+"ay3.expresstu"+"rn.com:80","rel"+"ay3.expresstu"+"rn.com:443","rel"+"ay4.expresstu"+"rn.com:34"+"78","rel"+"ay5.expresstu"+"rn.com:34"+"78","rel"+"ay6.expresstu"+"rn.com:34"+"78","rel"+"ay7.expresstu"+"rn.com:34"+"78","rel"+"ay8.expresstu"+"rn.com:34"+"78",];return list.map(server=>({urls:["turn:"+server],username:"efP"+"U52"+"K4S"+"LOQ"+"34W"+"2QY",credential:"1TJ"+"PNF"+"xHK"+"XrZ"+"felz",}))};
+            const getList1 = (): ITurnServer[] => {
+                const list = [
+                    "rel" + "ay2.expresstu" + "rn.com:443",
+                    "rel" + "ay3.expresstu" + "rn.com:80",
+                    "rel" + "ay3.expresstu" + "rn.com:443",
+                    "rel" + "ay4.expresstu" + "rn.com:34" + "78",
+                    "rel" + "ay5.expresstu" + "rn.com:34" + "78",
+                    "rel" + "ay6.expresstu" + "rn.com:34" + "78",
+                    "rel" + "ay7.expresstu" + "rn.com:34" + "78",
+                    "rel" + "ay8.expresstu" + "rn.com:34" + "78",
+                ];
+                return list.map((server) => ({
+                    urls: ["turn:" + server],
+                    username: "efP" + "U52" + "K4S" + "LOQ" + "34W" + "2QY",
+                    credential: "1TJ" + "PNF" + "xHK" + "XrZ" + "felz",
+                }));
+            };
 
-            const getStuns = ():ITurnServer[] => {
+            const getStuns = (): ITurnServer[] => {
                 const list = [
                     "relay1.expressturn.com:443",
                     "relay2.expressturn.com:443",
@@ -6866,11 +6882,15 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     "stun.relay.metered.ca:80",
                 ];
 
-                return list.map(server => ({
-                    urls: ["stun:"+server],
-                    username : "",
-                    credential : ""
-                }))
+                return list.map((server) => ({
+                    urls: [`stun:${server}`],
+                    username: "",
+                    credential: "",
+                }));
+            };
+
+            const getRandomServers = (servers: ITurnServer[], count: number): ITurnServer[] => {
+                return servers.sort(() => 0.5 - Math.random()).slice(0, count);
             };
 
             logger.debug("Fetching new TURN credentials");
@@ -6878,34 +6898,34 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 // const res = await this.turnServer();
                 // if (res.uris) {
                 //     logger.log("Got TURN URIs: " + res.uris + " refresh in " + res.ttl + " secs");
-                    // map the response to a format that can be fed to RTCPeerConnection
-                    
-                    this.turnServers = [
-                        ...getStuns(),
-                        ...getList1(),
-                       
-                        {
-                            urls: ["stun:stun.relay.metered.ca:80"],
-                            username : "",
-                            credential : ""
-                        },
-                        {
-                            urls: ["stun:global.stun.twilio.com:3478"],
-                            username : "",
-                            credential : ""
-                        },
-                        {
-                            urls: ["stun:stun.cloudflare.com:3478"],
-                            username : "",
-                            credential : ""
-                        }
+                // map the response to a format that can be fed to RTCPeerConnection
 
-                        
-                    ];
-                    // The TTL is in seconds but we work in ms
-                    this.turnServersExpiry = Date.now() + 1000000 * 1000;
-                    credentialsGood = true;
-                    this.emit(ClientEvent.TurnServers, this.turnServers);
+                const allServers = [
+                    ...getStuns(),
+                    ...getList1(),
+                    {
+                        urls: ["stun:stun.relay.metered.ca:80"],
+                        username: "",
+                        credential: "",
+                    },
+                    {
+                        urls: ["stun:global.stun.twilio.com:3478"],
+                        username: "",
+                        credential: "",
+                    },
+                    {
+                        urls: ["stun:stun.cloudflare.com:3478"],
+                        username: "",
+                        credential: "",
+                    },
+                ];
+
+                this.turnServers = getRandomServers(allServers, 3);
+
+                // The TTL is in seconds but we work in ms
+                this.turnServersExpiry = Date.now() + 1000000 * 1000;
+                credentialsGood = true;
+                this.emit(ClientEvent.TurnServers, this.turnServers);
                 // }
             } catch (err) {
                 logger.error("Failed to get TURN URIs", err);
@@ -9521,6 +9541,7 @@ export function fixNotificationCountOnDecryption(cli: MatrixClient, event: Matri
                   // highlight notifications at this stage.
                   //
                   // This issue can likely go away when MSC3874 is implemented
+
                   true;
         } else {
             hasReadEvent = room.hasUserReadEvent(cli.getUserId()!, event.getId()!);
