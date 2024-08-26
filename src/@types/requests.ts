@@ -62,7 +62,7 @@ export interface IRedactOpts {
 }
 
 export interface ISendEventResponse {
-    event_id: string;
+    event_id?: string;
 }
 
 export interface IPresenceOpts {
