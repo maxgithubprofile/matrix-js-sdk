@@ -6210,6 +6210,29 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         return Promise.all([readPromise, writePromise]).then(); // .then() to hide results for contract
     }
 
+     /**
+     * Set flags for invited acess access in a room.
+     * @param opts - Options
+     * @returns Promise which resolves
+     * @returns Rejects: with an error response.
+     */
+
+    public setInvitedAccess(roomId: string): Promise<void> {
+
+        let readPromise: Promise<any> = Promise.resolve<any>(undefined);
+            readPromise = this.sendStateEvent(
+                roomId,
+                EventType.RoomHistoryVisibility,
+                {
+                    history_visibility: "invited",
+                },
+                "",
+            );
+
+        return Promise.all([readPromise]).then(); // .then() to hide results for contract
+    }
+    
+
     /**
      * Requests an email verification token for the purposes of registration.
      * This API requests a token from the homeserver.
@@ -6224,6 +6247,8 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @param nextLink - As requestEmailToken
      * @returns Promise which resolves: As requestEmailToken
      */
+
+    
     public requestRegisterEmailToken(
         email: string,
         clientSecret: string,
