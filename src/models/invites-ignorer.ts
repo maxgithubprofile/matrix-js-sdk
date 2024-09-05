@@ -92,7 +92,7 @@ export class IgnoredInvites {
      * @param reason - A human-readable reason for introducing this new rule.
      * @returns The event id for the new rule.
      */
-    public async addRule(scope: PolicyScope, entity: string, reason: string): Promise<string> {
+    public async addRule(scope: PolicyScope, entity: string, reason: string): Promise<string | undefined> {
         const target = await this.getOrCreateTargetRoom();
         const response = await this.client.sendStateEvent(target.roomId, scopeToEventTypeMap[scope], {
             entity,
