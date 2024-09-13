@@ -6914,9 +6914,26 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 }));
             };
 
-            const getRandomServers = (servers: ITurnServer[], count: number): ITurnServer[] => {
-                return servers.sort(() => 0.5 - Math.random()).slice(0, count);
-            };
+            const freeStunServers = [
+                {
+                    urls: ["stun:stun.relay.metered.ca:80"],
+                    username: "",
+                    credential: "",
+                },
+                {
+                    urls: ["stun:global.stun.twilio.com:3478"],
+                    username: "",
+                    credential: "",
+                },
+                {
+                    urls: ["stun:stun.cloudflare.com:3478"],
+                    username: "",
+                    credential: "",
+                },
+            ];
+
+
+            const getRandomServer = (servers: ITurnServer[]) => servers[Math.floor(Math.random() * servers.length)];
 
             logger.debug("Fetching new TURN credentials");
             try {
@@ -6925,28 +6942,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 //     logger.log("Got TURN URIs: " + res.uris + " refresh in " + res.ttl + " secs");
                 // map the response to a format that can be fed to RTCPeerConnection
 
-                const allServers = [
-                    ...getStuns(),
-                    ...getList1(),
-                    {
-                        urls: ["stun:stun.relay.metered.ca:80"],
-                        username: "",
-                        credential: "",
-                    },
-                    {
-                        urls: ["stun:global.stun.twilio.com:3478"],
-                        username: "",
-                        credential: "",
-                    },
-                    {
-                        urls: ["stun:stun.cloudflare.com:3478"],
-                        username: "",
-                        credential: "",
-                    },
-                ];
+                const paidTurnServer = getRandomServer(getList1());
+                const paidStunServer = getRandomServer(getStuns());
+                const freeStunServer = getRandomServer(freeStunServers);
 
-                this.turnServers = getRandomServers(allServers, 3);
-
+                this.turnServers = [paidTurnServer, paidStunServer, freeStunServer];
                 // The TTL is in seconds but we work in ms
                 this.turnServersExpiry = Date.now() + 1000000 * 1000;
                 credentialsGood = true;
