@@ -7572,15 +7572,16 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 const list = [
                     "relay1.expressturn.com:443",
                     "relay2.expressturn.com:443",
+                    "relay3.expressturn.com:80",
                     "relay3.expressturn.com:443",
-                    "relay1.expressturn.com:3478",
-                    "relay2.expressturn.com:3478",
                     "relay4.expressturn.com:3478",
                     "relay5.expressturn.com:3478",
                     "relay6.expressturn.com:3478",
+                    "relay7.expressturn.com:3478",
                     "relay8.expressturn.com:3478",
-                    "relay1.expressturn.com:80",
-                    "stun.relay.metered.ca:80",
+                    "relay9.expressturn.com:3478",
+                    "relay10.expressturn.com:3478",
+                    "relay11.expressturn.com:3478"
                 ];
 
                 return list.map((server) => ({
@@ -7616,6 +7617,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     },
                     {
                         urls: ["stun:stun.cloudflare.com:3478"],
+                        username: "",
+                        credential: "",
+                    },
+                    {
+                        urls: ["stun:stun.relay.metered.ca:80"],
                         username: "",
                         credential: "",
                     },
