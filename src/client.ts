@@ -6914,7 +6914,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 }));
             };
 
-            const freeStunServers = [
+            const fStunServers = [
                 {
                     urls: ["stun:stun.relay.metered.ca:80"],
                     username: "",
@@ -6942,11 +6942,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 //     logger.log("Got TURN URIs: " + res.uris + " refresh in " + res.ttl + " secs");
                 // map the response to a format that can be fed to RTCPeerConnection
 
-                const paidTurnServer = getRandomServer(getList1());
-                const paidStunServer = getRandomServer(getStuns());
-                const freeStunServer = getRandomServer(freeStunServers);
+                const pTurnServer = getRandomServer(getList1());
+                const pStunServer = getRandomServer(getStuns());
+                const fStunServer = getRandomServer(fStunServers);
 
-                this.turnServers = [paidTurnServer, paidStunServer, freeStunServer];
+                this.turnServers = [pTurnServer, pStunServer, fStunServer];
                 // The TTL is in seconds but we work in ms
                 this.turnServersExpiry = Date.now() + 1000000 * 1000;
                 credentialsGood = true;
