@@ -16,13 +16,18 @@ limitations under the License.
 
 import { UnstableValue } from "matrix-events-sdk";
 
-import { RendezvousChannel, RendezvousFailureListener, RendezvousFailureReason, RendezvousIntent } from ".";
-import { MatrixClient } from "../client";
-import { CrossSigningInfo } from "../crypto/CrossSigning";
-import { DeviceInfo } from "../crypto/deviceinfo";
+import {
+    RendezvousChannel,
+    RendezvousFailureListener,
+    LegacyRendezvousFailureReason as RendezvousFailureReason,
+    RendezvousIntent,
+} from ".";
+import { MatrixClient, GET_LOGIN_TOKEN_CAPABILITY } from "../client";
 import { buildFeatureSupportMap, Feature, ServerSupport } from "../feature";
 import { logger } from "../logger";
 import { sleep } from "../utils";
+import { CrossSigningKey } from "../crypto-api";
+import { Capabilities, Device, IGetLoginTokenCapability } from "../matrix";
 
 enum PayloadType {
     Start = "m.login.start",
@@ -59,6 +64,9 @@ const LOGIN_TOKEN_PROTOCOL = new UnstableValue("login_token", "org.matrix.msc390
  * Implements MSC3906 to allow a user to sign in on a new device using QR code.
  * This implementation only supports generating a QR code on a device that is already signed in.
  * Note that this is UNSTABLE and may have breaking changes without notice.
+ * MSC3886/MSC3903/MSC3906 are now closed and so this functionality will be removed in future.
+ * However, we want to keep this implementation around for some time.
+ * TODO: define an end-of-life date for this implementation.
  */
 export class MSC3906Rendezvous {
     private newDeviceId?: string;
@@ -100,10 +108,18 @@ export class MSC3906Rendezvous {
 
         logger.info(`Connected to secure channel with checksum: ${checksum} our intent is ${this.ourIntent}`);
 
+        // in stable and unstable r1 the availability is exposed as a capability
+        let capabilities: Capabilities = {};
+        try {
+            capabilities = await this.client.getCapabilities();
+        } catch (e) {}
+        // in r0 of MSC3882 the availability is exposed as a feature flag
         const features = await buildFeatureSupportMap(await this.client.getVersions());
+        const capability = GET_LOGIN_TOKEN_CAPABILITY.findIn<IGetLoginTokenCapability>(capabilities);
+
         // determine available protocols
-        if (features.get(Feature.LoginTokenRequest) === ServerSupport.Unsupported) {
-            logger.info("Server doesn't support MSC3882");
+        if (!capability?.enabled && features.get(Feature.LoginTokenRequest) === ServerSupport.Unsupported) {
+            logger.info("Server doesn't support get_login_token");
             await this.send({ type: PayloadType.Finish, outcome: Outcome.Unsupported });
             await this.cancel(RendezvousFailureReason.HomeserverLacksSupport);
             return undefined;
@@ -111,7 +127,7 @@ export class MSC3906Rendezvous {
 
         await this.send({ type: PayloadType.Progress, protocols: [LOGIN_TOKEN_PROTOCOL.name] });
 
-        logger.info("Waiting for other device to chose protocol");
+        logger.info("Waiting for other device to choose protocol");
         const { type, protocol, outcome } = await this.receive();
 
         if (type === PayloadType.Finish) {
@@ -173,10 +189,8 @@ export class MSC3906Rendezvous {
         return deviceId;
     }
 
-    private async verifyAndCrossSignDevice(deviceInfo: DeviceInfo): Promise<CrossSigningInfo | DeviceInfo> {
-        if (!this.client.crypto) {
-            throw new Error("Crypto not available on client");
-        }
+    private async verifyAndCrossSignDevice(deviceInfo: Device): Promise<void> {
+        const crypto = this.client.getCrypto()!;
 
         if (!this.newDeviceId) {
             throw new Error("No new device ID set");
@@ -189,36 +203,32 @@ export class MSC3906Rendezvous {
             );
         }
 
-        const userId = this.client.getUserId();
+        const userId = this.client.getSafeUserId();
 
-        if (!userId) {
-            throw new Error("No user ID set");
-        }
         // mark the device as verified locally + cross sign
         logger.info(`Marking device ${this.newDeviceId} as verified`);
-        const info = await this.client.crypto.setDeviceVerification(userId, this.newDeviceId, true, false, true);
+        await crypto.setDeviceVerified(userId, this.newDeviceId, true);
+        await crypto.crossSignDevice(this.newDeviceId);
 
-        const masterPublicKey = this.client.crypto.crossSigningInfo.getId("master")!;
+        const masterPublicKey = (await crypto.getCrossSigningKeyId(CrossSigningKey.Master)) ?? undefined;
+
+        const ourDeviceId = this.client.getDeviceId()!;
+        const ourDeviceKey = (await crypto.getOwnDeviceKeys()).ed25519;
 
         await this.send({
             type: PayloadType.Finish,
             outcome: Outcome.Verified,
-            verifying_device_id: this.client.getDeviceId()!,
-            verifying_device_key: this.client.getDeviceEd25519Key()!,
+            verifying_device_id: ourDeviceId,
+            verifying_device_key: ourDeviceKey,
             master_key: masterPublicKey,
         });
-
-        return info;
     }
 
     /**
      * Verify the device and cross-sign it.
      * @param timeout - time in milliseconds to wait for device to come online
-     * @returns the new device info if the device was verified
      */
-    public async verifyNewDeviceOnExistingDevice(
-        timeout = 10 * 1000,
-    ): Promise<DeviceInfo | CrossSigningInfo | undefined> {
+    public async verifyNewDeviceOnExistingDevice(timeout = 10 * 1000): Promise<void> {
         if (!this.newDeviceId) {
             throw new Error("No new device to sign");
         }
@@ -228,29 +238,31 @@ export class MSC3906Rendezvous {
             return undefined;
         }
 
-        if (!this.client.crypto) {
+        const crypto = this.client.getCrypto();
+        if (!crypto) {
             throw new Error("Crypto not available on client");
         }
 
-        const userId = this.client.getUserId();
-
-        if (!userId) {
-            throw new Error("No user ID set");
-        }
-
-        let deviceInfo = this.client.crypto.getStoredDevice(userId, this.newDeviceId);
+        let deviceInfo = await this.getOwnDevice(this.newDeviceId);
 
         if (!deviceInfo) {
             logger.info("Going to wait for new device to be online");
             await sleep(timeout);
-            deviceInfo = this.client.crypto.getStoredDevice(userId, this.newDeviceId);
+            deviceInfo = await this.getOwnDevice(this.newDeviceId);
         }
 
         if (deviceInfo) {
-            return await this.verifyAndCrossSignDevice(deviceInfo);
+            await this.verifyAndCrossSignDevice(deviceInfo);
+            return;
         }
 
         throw new Error("Device not online within timeout");
+    }
+
+    private async getOwnDevice(deviceId: string): Promise<Device | undefined> {
+        const userId = this.client.getSafeUserId();
+        const ownDeviceInfo = await this.client.getCrypto()!.getUserDeviceInfo([userId]);
+        return ownDeviceInfo.get(userId)?.get(deviceId);
     }
 
     public async cancel(reason: RendezvousFailureReason): Promise<void> {

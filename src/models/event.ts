@@ -1,5 +1,5 @@
 /*
-Copyright 2015 - 2022 The Matrix.org Foundation C.I.C.
+Copyright 2015 - 2023 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,18 +24,30 @@ import { ExtensibleEvent, ExtensibleEvents, Optional } from "matrix-events-sdk";
 import type { IEventDecryptionResult } from "../@types/crypto";
 import { logger } from "../logger";
 import { VerificationRequest } from "../crypto/verification/request/VerificationRequest";
-import { EVENT_VISIBILITY_CHANGE_TYPE, EventType, MsgType, RelationType } from "../@types/event";
+import {
+    EVENT_VISIBILITY_CHANGE_TYPE,
+    EventType,
+    MsgType,
+    RelationType,
+    ToDeviceMessageId,
+    UNSIGNED_THREAD_ID_FIELD,
+    UNSIGNED_MEMBERSHIP_FIELD,
+} from "../@types/event";
 import { Crypto } from "../crypto";
 import { deepSortedObjectEntries, internaliseString } from "../utils";
 import { RoomMember } from "./room-member";
-import { Thread, ThreadEvent, EventHandlerMap as ThreadEventHandlerMap, THREAD_RELATION_TYPE } from "./thread";
+import { Thread, THREAD_RELATION_TYPE, ThreadEvent, ThreadEventHandlerMap } from "./thread";
 import { IActionsObject } from "../pushprocessor";
 import { TypedReEmitter } from "../ReEmitter";
 import { MatrixError } from "../http-api";
 import { TypedEventEmitter } from "./typed-event-emitter";
 import { EventStatus } from "./event-status";
-import { DecryptionError } from "../crypto/algorithms";
-import { CryptoBackend } from "../common-crypto/CryptoBackend";
+import { CryptoBackend, DecryptionError } from "../common-crypto/CryptoBackend";
+import { IAnnotatedPushRule } from "../@types/PushRules";
+import { Room } from "./room";
+import { EventTimeline } from "./event-timeline";
+import { Membership } from "../@types/membership";
+import { DecryptionFailureCode } from "../crypto-api";
 
 export { EventStatus } from "./event-status";
 
@@ -43,22 +55,27 @@ export { EventStatus } from "./event-status";
 export interface IContent {
     [key: string]: any;
     "msgtype"?: MsgType | string;
-    "membership"?: string;
+    "membership"?: Membership;
     "avatar_url"?: string;
     "displayname"?: string;
     "m.relates_to"?: IEventRelation;
+
+    "m.mentions"?: IMentions;
 }
 
 type StrippedState = Required<Pick<IEvent, "content" | "state_key" | "type" | "sender">>;
 
 export interface IUnsigned {
+    [key: string]: any;
     "age"?: number;
     "prev_sender"?: string;
     "prev_content"?: IContent;
     "redacted_because"?: IEvent;
+    "replaces_state"?: string;
     "transaction_id"?: string;
     "invite_room_state"?: StrippedState[];
     "m.relations"?: Record<RelationType | string, any>; // No common pattern for aggregated relations
+    [UNSIGNED_THREAD_ID_FIELD.name]?: string;
 }
 
 export interface IThreadBundledRelationship {
@@ -76,22 +93,9 @@ export interface IEvent {
     origin_server_ts: number;
     txn_id?: string;
     state_key?: string;
-    membership?: string;
+    membership?: Membership;
     unsigned: IUnsigned;
     redacts?: string;
-
-    /**
-     * @deprecated in favour of `sender`
-     */
-    user_id?: string;
-    /**
-     * @deprecated in favour of `unsigned.prev_content`
-     */
-    prev_content?: IContent;
-    /**
-     * @deprecated in favour of `origin_server_ts`
-     */
-    age?: number;
 }
 
 export interface IAggregatedRelation {
@@ -111,6 +115,16 @@ export interface IEventRelation {
         event_id?: string;
     };
     "key"?: string;
+}
+
+export interface IMentions {
+    user_ids?: string[];
+    room?: boolean;
+}
+
+export interface PushDetails {
+    rule?: IAnnotatedPushRule;
+    actions?: IActionsObject;
 }
 
 /**
@@ -137,6 +151,10 @@ export interface IVisibilityChange {
     reason: string | null;
 }
 
+export interface IMarkedUnreadEvent {
+    unread: boolean;
+}
+
 export interface IClearEvent {
     room_id?: string;
     type: string;
@@ -151,11 +169,23 @@ interface IKeyRequestRecipient {
 }
 
 export interface IDecryptOptions {
-    // Emits "event.decrypted" if set to true
+    /** Whether to emit {@link MatrixEventEvent.Decrypted} events on successful decryption. Defaults to true.
+     */
     emit?: boolean;
-    // True if this is a retry (enables more logging)
+
+    /**
+     * True if this is a retry, after receiving an update to the session key. (Enables more logging.)
+     *
+     * This is only intended for use within the js-sdk.
+     *
+     * @internal
+     */
     isRetry?: boolean;
-    // whether the message should be re-decrypted if it was previously successfully decrypted with an untrusted key
+
+    /**
+     * Whether the message should be re-decrypted if it was previously successfully decrypted with an untrusted key.
+     * Defaults to `false`.
+     */
     forceRedecryptIfUntrusted?: boolean;
 }
 
@@ -184,7 +214,18 @@ export interface IMessageVisibilityHidden {
 const MESSAGE_VISIBLE: IMessageVisibilityVisible = Object.freeze({ visible: true });
 
 export enum MatrixEventEvent {
+    /**
+     * An event has been decrypted, or we have failed to decrypt it.
+     *
+     * The payload consists of:
+     *
+     *  * `event` - The {@link MatrixEvent} which we attempted to decrypt.
+     *
+     *  * `err` - The error that occurred during decryption, or `undefined` if no error occurred.
+     *     Avoid use of this: {@link MatrixEvent.decryptionFailureReason} is more useful.
+     */
     Decrypted = "Event.decrypted",
+
     BeforeRedaction = "Event.beforeRedaction",
     VisibilityChange = "Event.visibilityChange",
     LocalEventIdReplaced = "Event.localEventIdReplaced",
@@ -196,12 +237,6 @@ export enum MatrixEventEvent {
 export type MatrixEventEmittedEvents = MatrixEventEvent | ThreadEvent.Update;
 
 export type MatrixEventHandlerMap = {
-    /**
-     * Fires when an event is decrypted
-     *
-     * @param event - The matrix event which has been decrypted
-     * @param err - The error that occurred during decryption, or `undefined` if no error occurred.
-     */
     [MatrixEventEvent.Decrypted]: (event: MatrixEvent, err?: Error) => void;
     [MatrixEventEvent.BeforeRedaction]: (event: MatrixEvent, redactionEvent: MatrixEvent) => void;
     [MatrixEventEvent.VisibilityChange]: (event: MatrixEvent, visible: boolean) => void;
@@ -212,7 +247,8 @@ export type MatrixEventHandlerMap = {
 } & Pick<ThreadEventHandlerMap, ThreadEvent.Update>;
 
 export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, MatrixEventHandlerMap> {
-    private pushActions: IActionsObject | null = null;
+    // applied push rule and action for this event
+    private pushDetails: PushDetails = {};
     private _replacingEvent: MatrixEvent | null = null;
     private _localRedactionEvent: MatrixEvent | null = null;
     private _isCancelled = false;
@@ -229,6 +265,9 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     // a public getter to decide if the cache is valid.
     private _hasCachedExtEv = false;
     private _cachedExtEv: Optional<ExtensibleEvent> = undefined;
+
+    /** If we failed to decrypt this event, the reason for the failure. Otherwise, `null`. */
+    private _decryptionFailureReason: DecryptionFailureCode | null = null;
 
     /* curve25519 key which we believe belongs to the sender of the event. See
      * getSenderKey()
@@ -267,7 +306,6 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     private txnId?: string;
 
     /**
-     * @experimental
      * A reference to the thread this event belongs to
      */
     private thread?: Thread;
@@ -306,7 +344,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     /**
      * most recent error associated with sending the event, if any
      * @privateRemarks
-     * Should be read-only
+     * Should be read-only. May not be a MatrixError.
      */
     public error: MatrixError | null = null;
     /**
@@ -360,7 +398,13 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         });
 
         this.txnId = event.txn_id;
-        this.localTimestamp = Date.now() - (this.getAge() ?? 0);
+        // The localTimestamp is calculated using the age.
+        // Some events lack an `age` property, either because they are EDUs such as typing events,
+        // or due to server-side bugs such as https://github.com/matrix-org/synapse/issues/8429.
+        // The fallback in these cases will be to use the origin_server_ts.
+        // For EDUs, the origin_server_ts also is not defined so we use Date.now().
+        const age = this.getAge();
+        this.localTimestamp = age !== undefined ? Date.now() - age : (this.getTs() ?? Date.now());
         this.reEmitter = new TypedReEmitter(this);
     }
 
@@ -384,9 +428,12 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     }
 
     /**
-     * Gets the event as though it would appear unencrypted. If the event is already not
-     * encrypted, it is simply returned as-is.
-     * @returns The event in wire format.
+     * Gets the event as it would appear if it had been sent unencrypted.
+     *
+     * If the event is encrypted, we attempt to mock up an event as it would have looked had the sender not encrypted it.
+     * If the event is not encrypted, a copy of it is simply returned as-is.
+     *
+     * @returns A shallow copy of the event, in wire format, as it would have been had it not been encrypted.
      */
     public getEffectiveEvent(): IEvent {
         const content = Object.assign({}, this.getContent()); // clone for mutation
@@ -427,7 +474,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @returns The user ID, e.g. `@alice:matrix.org`
      */
     public getSender(): string | undefined {
-        return this.event.sender || this.event.user_id; // v2 / v1
+        return this.event.sender; // v2 / v1
     }
 
     /**
@@ -490,16 +537,15 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * ```
      */
     public getDetails(): string {
-        let details = `id=${this.getId()} type=${this.getWireType()} sender=${this.getSender()}`;
         const room = this.getRoomId();
         if (room) {
-            details += ` room=${room}`;
+            // in-room event
+            return `id=${this.getId()} type=${this.getWireType()} sender=${this.getSender()} room=${room} ts=${this.getDate()?.toISOString()}`;
+        } else {
+            // to-device event
+            const msgid = this.getContent()[ToDeviceMessageId];
+            return `msgid=${msgid} type=${this.getWireType()} sender=${this.getSender()}`;
         }
-        const date = this.getDate();
-        if (date) {
-            details += ` ts=${date.toISOString()}`;
-        }
-        return details;
     }
 
     /**
@@ -546,38 +592,49 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     }
 
     /**
-     * @experimental
      * Get the event ID of the thread head
      */
     public get threadRootId(): string | undefined {
+        // don't allow state events to be threaded as per the spec
+        if (this.isState()) {
+            return undefined;
+        }
         const relatesTo = this.getWireContent()?.["m.relates_to"];
         if (relatesTo?.rel_type === THREAD_RELATION_TYPE.name) {
             return relatesTo.event_id;
-        } else {
-            return this.getThread()?.id || this.threadId;
         }
+        if (this.thread) {
+            return this.thread.id;
+        }
+        if (this.threadId !== undefined) {
+            return this.threadId;
+        }
+        const unsigned = this.getUnsigned();
+        if (typeof unsigned[UNSIGNED_THREAD_ID_FIELD.name] === "string") {
+            return unsigned[UNSIGNED_THREAD_ID_FIELD.name];
+        }
+        return undefined;
     }
 
     /**
-     * @experimental
+     * A helper to check if an event is a thread's head or not
      */
     public get isThreadRoot(): boolean {
+        // don't allow state events to be threaded as per the spec
+        if (this.isState()) {
+            return false;
+        }
+
         const threadDetails = this.getServerAggregatedRelation<IThreadBundledRelationship>(THREAD_RELATION_TYPE.name);
 
         // Bundled relationships only returned when the sync response is limited
         // hence us having to check both bundled relation and inspect the thread
         // model
-        return !!threadDetails || this.getThread()?.id === this.getId();
+        return !!threadDetails || this.threadRootId === this.getId();
     }
 
     public get replyEventId(): string | undefined {
-        // We're prefer ev.getContent() over ev.getWireContent() to make sure
-        // we grab the latest edit with potentially new relations. But we also
-        // can't just rely on ev.getContent() by itself because historically we
-        // still show the reply from the original message even though the edit
-        // event does not include the relation reply.
-        const mRelatesTo = this.getContent()["m.relates_to"] || this.getWireContent()["m.relates_to"];
-        return mRelatesTo?.["m.in_reply_to"]?.event_id;
+        return this.getWireContent()["m.relates_to"]?.["m.in_reply_to"]?.event_id;
     }
 
     public get relationEventId(): string | undefined {
@@ -591,7 +648,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      */
     public getPrevContent(): IContent {
         // v2 then v1 then default
-        return this.getUnsigned().prev_content || this.event.prev_content || {};
+        return this.getUnsigned().prev_content || {};
     }
 
     /**
@@ -615,7 +672,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @returns The age of this event in milliseconds.
      */
     public getAge(): number | undefined {
-        return this.getUnsigned().age || this.event.age; // v2 / v1
+        return this.getUnsigned().age;
     }
 
     /**
@@ -643,6 +700,18 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      */
     public isState(): boolean {
         return this.event.state_key !== undefined;
+    }
+
+    /**
+     * Get the user's room membership at the time the event was sent, as reported
+     * by the server.  This uses MSC4115.
+     *
+     * @returns The user's room membership, or `undefined` if the server does
+     *   not report it.
+     */
+    public getMembershipAtEvent(): Optional<Membership | string> {
+        const unsigned = this.getUnsigned();
+        return UNSIGNED_MEMBERSHIP_FIELD.findIn<Membership | string>(unsigned);
     }
 
     /**
@@ -703,7 +772,22 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      *     couldn't decrypt.
      */
     public isDecryptionFailure(): boolean {
-        return this.clearEvent?.content?.msgtype === "m.bad.encrypted";
+        return this._decryptionFailureReason !== null;
+    }
+
+    /** If we failed to decrypt this event, the reason for the failure. Otherwise, `null`. */
+    public get decryptionFailureReason(): DecryptionFailureCode | null {
+        return this._decryptionFailureReason;
+    }
+
+    /**
+     * True if this event is an encrypted event which we failed to decrypt, the receiver's device is unverified and
+     * the sender has disabled encrypting to unverified devices.
+     *
+     * @deprecated: Prefer `event.decryptionFailureReason === DecryptionFailureCode.MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE`.
+     */
+    public get isEncryptedDisabledForUnverifiedDevices(): boolean {
+        return this.decryptionFailureReason === DecryptionFailureCode.MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE;
     }
 
     public shouldAttemptDecryption(): boolean {
@@ -786,22 +870,14 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @returns array of recipients
      */
     public getKeyRequestRecipients(userId: string): IKeyRequestRecipient[] {
-        // send the request to all of our own devices, and the
-        // original sending device if it wasn't us.
-        const wireContent = this.getWireContent();
+        // send the request to all of our own devices
         const recipients = [
             {
                 userId,
                 deviceId: "*",
             },
         ];
-        const sender = this.getSender();
-        if (sender !== userId) {
-            recipients.push({
-                userId: sender!,
-                deviceId: wireContent.device_id,
-            });
-        }
+
         return recipients;
     }
 
@@ -816,17 +892,14 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         while (true) {
             this.retryDecryption = false;
 
-            let res: IEventDecryptionResult;
             let err: Error | undefined = undefined;
             try {
-                if (!crypto) {
-                    res = this.badEncryptedMessage("Encryption not enabled");
-                } else {
-                    res = await crypto.decryptEvent(this);
-                    if (options.isRetry === true) {
-                        logger.info(`Decrypted event on retry (${this.getDetails()})`);
-                    }
+                const res = await crypto.decryptEvent(this);
+                if (options.isRetry === true) {
+                    logger.info(`Decrypted event on retry (${this.getDetails()})`);
                 }
+                this.setClearData(res);
+                this._decryptionFailureReason = null;
             } catch (e) {
                 const detailedError = e instanceof DecryptionError ? (<DecryptionError>e).detailedString : String(e);
 
@@ -859,14 +932,12 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
                 // so we don't bother to log `e` separately.
                 logger.warn(`Error decrypting event (${this.getDetails()}): ${detailedError}`);
 
-                res = this.badEncryptedMessage(String(e));
+                this.setClearDataForDecryptionFailure(String(e));
+                this._decryptionFailureReason =
+                    e instanceof DecryptionError ? (<DecryptionError>e).code : DecryptionFailureCode.UNKNOWN_ERROR;
             }
 
-            // at this point, we've either successfully decrypted the event, or have given up
-            // (and set res to a 'badEncryptedMessage'). Either way, we can now set the
-            // cleartext of the event and raise Event.decrypted.
-            //
-            // make sure we clear 'decryptionPromise' before sending the 'Event.decrypted' event,
+            // Make sure we clear 'decryptionPromise' before sending the 'Event.decrypted' event,
             // otherwise the app will be confused to see `isBeingDecrypted` still set when
             // there isn't an `Event.decrypted` on the way.
             //
@@ -874,7 +945,6 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
             //
             this.decryptionPromise = null;
             this.retryDecryption = false;
-            this.setClearData(res);
 
             // Before we emit the event, clear the push actions so that they can be recalculated
             // by relevant code. We do this because the clear event has now changed, making it
@@ -882,7 +952,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
             // highlighting when the user's name is mentioned rely on this happening. We also want
             // to set the push actions before emitting so that any notification listeners don't
             // pick up the wrong contents.
-            this.setPushActions(null);
+            this.setPushDetails();
 
             if (options.emit !== false) {
                 this.emit(MatrixEventEvent.Decrypted, this, err);
@@ -890,18 +960,6 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
 
             return;
         }
-    }
-
-    private badEncryptedMessage(reason: string): IEventDecryptionResult {
-        return {
-            clearEvent: {
-                type: EventType.RoomMessage,
-                content: {
-                    msgtype: "m.bad.encrypted",
-                    body: "** Unable to decrypt: " + reason + " **",
-                },
-            },
-        };
     }
 
     /**
@@ -912,9 +970,6 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @internal
      *
      * @param decryptionResult - the decryption result, including the plaintext and some key info
-     *
-     * @remarks
-     * Fires {@link MatrixEventEvent.Decrypted}
      */
     private setClearData(decryptionResult: IEventDecryptionResult): void {
         this.clearEvent = decryptionResult.clearEvent;
@@ -922,6 +977,26 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         this.claimedEd25519Key = decryptionResult.claimedEd25519Key ?? null;
         this.forwardingCurve25519KeyChain = decryptionResult.forwardingCurve25519KeyChain || [];
         this.untrusted = decryptionResult.untrusted || false;
+        this.invalidateExtensibleEvent();
+    }
+
+    /**
+     * Update the cleartext data on this event after a decryption failure.
+     *
+     * @param reason - the textual reason for the failure
+     */
+    private setClearDataForDecryptionFailure(reason: string): void {
+        this.clearEvent = {
+            type: EventType.RoomMessage,
+            content: {
+                msgtype: "m.bad.encrypted",
+                body: `** Unable to decrypt: ${reason} **`,
+            },
+        };
+        this.senderCurve25519Key = null;
+        this.claimedEd25519Key = null;
+        this.forwardingCurve25519KeyChain = [];
+        this.untrusted = false;
         this.invalidateExtensibleEvent();
     }
 
@@ -984,7 +1059,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * signing the public curve25519 key with the ed25519 key.
      *
      * In general, applications should not use this method directly, but should
-     * instead use MatrixClient.getEventSenderDeviceInfo.
+     * instead use {@link Crypto.CryptoApi#getEncryptionInfoForEvent}.
      */
     public getClaimedEd25519Key(): string | null {
         return this.claimedEd25519Key;
@@ -1095,8 +1170,9 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * if it were redacted before it was sent to us
      *
      * @param redactionEvent - event causing the redaction
+     * @param room - the room in which the event exists
      */
-    public makeRedacted(redactionEvent: MatrixEvent): void {
+    public makeRedacted(redactionEvent: MatrixEvent, room: Room): void {
         // quick sanity-check
         if (!redactionEvent.event) {
             throw new Error("invalid redactionEvent in makeRedacted");
@@ -1140,7 +1216,41 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
             }
         }
 
+        // If the redacted event was in a thread (but not thread root), move it
+        // to the main timeline. This will change if MSC3389 is merged.
+        if (!this.isThreadRoot && this.threadRootId && this.threadRootId !== this.getId()) {
+            this.moveAllRelatedToMainTimeline(room);
+            redactionEvent.moveToMainTimeline(room);
+        }
+
         this.invalidateExtensibleEvent();
+    }
+
+    private moveAllRelatedToMainTimeline(room: Room): void {
+        const thread = this.thread;
+        this.moveToMainTimeline(room);
+
+        // If we dont have access to the thread, we can only move this
+        // event, not things related to it.
+        if (thread) {
+            for (const event of thread.events) {
+                if (event.getRelation()?.event_id === this.getId()) {
+                    event.moveAllRelatedToMainTimeline(room);
+                }
+            }
+        }
+    }
+
+    private moveToMainTimeline(room: Room): void {
+        // Remove it from its thread
+        this.thread?.timelineSet.removeEvent(this.getId()!);
+        this.setThread(undefined);
+
+        // And insert it into the main timeline
+        const timeline = room.getLiveTimeline();
+        // We use insertEventIntoTimeline to insert it in timestamp order,
+        // because we don't know where it should go (until we have MSC4033).
+        timeline.getTimelineSet().insertEventIntoTimeline(this, timeline, timeline.getState(EventTimeline.FORWARDS)!);
     }
 
     /**
@@ -1233,16 +1343,29 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @returns push actions
      */
     public getPushActions(): IActionsObject | null {
-        return this.pushActions;
+        return this.pushDetails.actions || null;
     }
 
     /**
-     * Set the push actions for this event.
+     * Get the push details, if known, for this event
+     *
+     * @returns push actions
+     */
+    public getPushDetails(): PushDetails {
+        return this.pushDetails;
+    }
+
+    /**
+     * Set the push details for this event.
      *
      * @param pushActions - push actions
+     * @param rule - the executed push rule
      */
-    public setPushActions(pushActions: IActionsObject | null): void {
-        this.pushActions = pushActions;
+    public setPushDetails(pushActions?: IActionsObject, rule?: IAnnotatedPushRule): void {
+        this.pushDetails = {
+            actions: pushActions,
+            rule,
+        };
     }
 
     /**
@@ -1308,8 +1431,12 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         // Relation info is lifted out of the encrypted content when sent to
         // encrypted rooms, so we have to check `getWireContent` for this.
         const relation = this.getWireContent()?.["m.relates_to"];
-        if (this.isState() && relation?.rel_type === RelationType.Replace) {
-            // State events cannot be m.replace relations
+        if (
+            this.isState() &&
+            !!relation?.rel_type &&
+            ([RelationType.Replace, RelationType.Thread] as string[]).includes(relation.rel_type)
+        ) {
+            // State events cannot be m.replace or m.thread relations
             return false;
         }
         return !!(relation?.rel_type && relation.event_id && (relType ? relation.rel_type === relType : true));
@@ -1430,14 +1557,6 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
 
     /**
      * Checks if this event is associated with another event. See `getAssociatedId`.
-     * @deprecated use hasAssociation instead.
-     */
-    public hasAssocation(): boolean {
-        return !!this.getAssociatedId();
-    }
-
-    /**
-     * Checks if this event is associated with another event. See `getAssociatedId`.
      */
     public hasAssociation(): boolean {
         return !!this.getAssociatedId();
@@ -1521,15 +1640,21 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     }
 
     /**
-     * Summarise the event as JSON. This is currently used by React SDK's view
-     * event source feature and Seshat's event indexing, so take care when
-     * adjusting the output here.
+     * Summarise the event as JSON.
      *
      * If encrypted, include both the decrypted and encrypted view of the event.
      *
      * This is named `toJSON` for use with `JSON.stringify` which checks objects
      * for functions named `toJSON` and will call them to customise the output
      * if they are defined.
+     *
+     * **WARNING** Do not log the result of this method; otherwise, it will end up
+     * in rageshakes, leading to a privacy violation.
+     *
+     * @deprecated Prefer to use {@link MatrixEvent#getEffectiveEvent} or similar.
+     * This method will be removed soon; it is too easy to use it accidentally
+     * and cause a privacy violation (cf https://github.com/vector-im/element-web/issues/26380).
+     * In any case, the value it returns is not a faithful serialization of the object.
      */
     public toJSON(): object {
         const event = this.getEffectiveEvent();
@@ -1557,9 +1682,14 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     }
 
     /**
-     * @experimental
+     * Set the instance of a thread associated with the current event
+     * @param thread - the thread
      */
     public setThread(thread?: Thread): void {
+        // don't allow state events to be threaded as per the spec
+        if (this.isState()) {
+            return;
+        }
         if (this.thread) {
             this.reEmitter.stopReEmitting(this.thread, [ThreadEvent.Update]);
         }
@@ -1571,7 +1701,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     }
 
     /**
-     * @experimental
+     * Get the instance of the thread associated with the current event
      */
     public getThread(): Thread | undefined {
         return this.thread;
@@ -1607,7 +1737,6 @@ const REDACT_KEEP_KEYS = new Set([
 // a map from state event type to the .content keys we keep when an event is redacted
 const REDACT_KEEP_CONTENT_MAP: Record<string, Record<string, 1>> = {
     [EventType.RoomMember]: { membership: 1 },
-    [EventType.RoomCreate]: { creator: 1 },
     [EventType.RoomJoinRules]: { join_rule: 1 },
     [EventType.RoomPowerLevels]: {
         ban: 1,

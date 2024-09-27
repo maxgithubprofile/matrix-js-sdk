@@ -26,6 +26,7 @@ import { IContent, MatrixEvent, RoomMember } from "../../matrix";
 import { Crypto, IEncryptedContent, IEventDecryptionResult, IncomingRoomKeyRequest } from "..";
 import { DeviceInfo } from "../deviceinfo";
 import { IRoomEncryption } from "../RoomList";
+import { DeviceInfoMap } from "../DeviceList";
 
 /**
  * Map of registered encryption algorithm classes. A map from string to {@link EncryptionAlgorithm} class
@@ -65,7 +66,6 @@ export abstract class EncryptionAlgorithm {
     protected readonly crypto: Crypto;
     protected readonly olmDevice: OlmDevice;
     protected readonly baseApis: MatrixClient;
-    protected readonly roomId?: string;
 
     /**
      * @param params - parameters
@@ -76,7 +76,6 @@ export abstract class EncryptionAlgorithm {
         this.crypto = params.crypto;
         this.olmDevice = params.olmDevice;
         this.baseApis = params.baseApis;
-        this.roomId = params.roomId;
     }
 
     /**
@@ -126,14 +125,12 @@ export abstract class DecryptionAlgorithm {
     protected readonly crypto: Crypto;
     protected readonly olmDevice: OlmDevice;
     protected readonly baseApis: MatrixClient;
-    protected readonly roomId?: string;
 
     public constructor(params: DecryptionClassParams) {
         this.userId = params.userId;
         this.crypto = params.crypto;
         this.olmDevice = params.olmDevice;
         this.baseApis = params.baseApis;
-        this.roomId = params.roomId;
     }
 
     /**
@@ -195,42 +192,7 @@ export abstract class DecryptionAlgorithm {
     }
 
     public onRoomKeyWithheldEvent?(event: MatrixEvent): Promise<void>;
-    public sendSharedHistoryInboundSessions?(devicesByUser: Record<string, DeviceInfo[]>): Promise<void>;
-}
-
-/**
- * Exception thrown when decryption fails
- *
- * @param msg - user-visible message describing the problem
- *
- * @param details - key/value pairs reported in the logs but not shown
- *   to the user.
- */
-export class DecryptionError extends Error {
-    public readonly detailedString: string;
-
-    public constructor(public readonly code: string, msg: string, details?: Record<string, string | Error>) {
-        super(msg);
-        this.code = code;
-        this.name = "DecryptionError";
-        this.detailedString = detailedStringForDecryptionError(this, details);
-    }
-}
-
-function detailedStringForDecryptionError(err: DecryptionError, details?: Record<string, string | Error>): string {
-    let result = err.name + "[msg: " + err.message;
-
-    if (details) {
-        result +=
-            ", " +
-            Object.keys(details)
-                .map((k) => k + ": " + details[k])
-                .join(", ");
-    }
-
-    result += "]";
-
-    return result;
+    public sendSharedHistoryInboundSessions?(devicesByUser: Map<string, DeviceInfo[]>): Promise<void>;
 }
 
 export class UnknownDeviceError extends Error {
@@ -243,7 +205,7 @@ export class UnknownDeviceError extends Error {
      */
     public constructor(
         msg: string,
-        public readonly devices: Record<string, Record<string, object>>,
+        public readonly devices: DeviceInfoMap,
         public event?: MatrixEvent,
     ) {
         super(msg);
@@ -269,3 +231,6 @@ export function registerAlgorithm<P extends IParams = IParams>(
     ENCRYPTION_CLASSES.set(algorithm, encryptor as new (params: IParams) => EncryptionAlgorithm);
     DECRYPTION_CLASSES.set(algorithm, decryptor as new (params: DecryptionClassParams) => DecryptionAlgorithm);
 }
+
+/* Re-export for backwards compatibility. Deprecated: this is an internal class. */
+export { DecryptionError } from "../../common-crypto/CryptoBackend";

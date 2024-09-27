@@ -25,19 +25,32 @@ import {
     ISendEventFromWidgetResponseData,
 } from "matrix-widget-api";
 
-import { IEvent, IContent, EventStatus } from "./models/event";
-import { ISendEventResponse } from "./@types/requests";
-import { EventType } from "./@types/event";
+import { MatrixEvent, IEvent, IContent, EventStatus } from "./models/event";
+import {
+    ISendEventResponse,
+    SendDelayedEventRequestOpts,
+    SendDelayedEventResponse,
+    UpdateDelayedEventAction,
+} from "./@types/requests";
+import { EventType, StateEvents } from "./@types/event";
 import { logger } from "./logger";
-import { MatrixClient, ClientEvent, IMatrixClientCreateOpts, IStartClientOpts } from "./client";
+import {
+    MatrixClient,
+    ClientEvent,
+    IMatrixClientCreateOpts,
+    IStartClientOpts,
+    SendToDeviceContentMap,
+    IOpenIDToken,
+    UNSTABLE_MSC4140_DELAYED_EVENTS,
+} from "./client";
 import { SyncApi, SyncState } from "./sync";
 import { SlidingSyncSdk } from "./sliding-sync-sdk";
-import { MatrixEvent } from "./models/event";
 import { User } from "./models/user";
 import { Room } from "./models/room";
-import { ToDeviceBatch } from "./models/ToDeviceMessage";
+import { ToDeviceBatch, ToDevicePayload } from "./models/ToDeviceMessage";
 import { DeviceInfo } from "./crypto/deviceinfo";
 import { IOlmDevice } from "./crypto/algorithms/megolm";
+import { MapWithDefault, recursiveMapToObject } from "./utils";
 
 interface IStateEventRequest {
     eventType: string;
@@ -88,6 +101,20 @@ export interface ICapabilities {
      * @defaultValue false
      */
     turnServers?: boolean;
+
+    /**
+     * Whether this client needs to be able to send delayed events.
+     * @experimental Part of MSC4140 & MSC4157
+     * @defaultValue false
+     */
+    sendDelayedEvents?: boolean;
+
+    /**
+     * Whether this client needs to be able to update delayed events.
+     * @experimental Part of MSC4140 & MSC4157
+     * @defaultValue false
+     */
+    updateDelayedEvents?: boolean;
 }
 
 /**
@@ -97,17 +124,30 @@ export interface ICapabilities {
  */
 export class RoomWidgetClient extends MatrixClient {
     private room?: Room;
-    private widgetApiReady = new Promise<void>((resolve) => this.widgetApi.once("ready", resolve));
+    private readonly widgetApiReady: Promise<void>;
     private lifecycle?: AbortController;
     private syncState: SyncState | null = null;
 
+    /**
+     *
+     * @param widgetApi - The widget api to use for communication.
+     * @param capabilities - The capabilities the widget client will request.
+     * @param roomId - The room id the widget is associated with.
+     * @param opts - The configuration options for this client.
+     * @param sendContentLoaded - Whether to send a content loaded widget action immediately after initial setup.
+     *   Set to `false` if the widget uses `waitForIFrameLoad=true` (in this case the client does not expect a content loaded action at all),
+     *   or if the the widget wants to send the `ContentLoaded` action at a later point in time after the initial setup.
+     */
     public constructor(
         private readonly widgetApi: WidgetApi,
         private readonly capabilities: ICapabilities,
         private readonly roomId: string,
         opts: IMatrixClientCreateOpts,
+        sendContentLoaded: boolean,
     ) {
         super(opts);
+
+        this.widgetApiReady = new Promise<void>((resolve) => this.widgetApi.once("ready", resolve));
 
         // Request capabilities for the functionality this client needs to support
         if (
@@ -142,6 +182,18 @@ export class RoomWidgetClient extends MatrixClient {
         );
         capabilities.sendToDevice?.forEach((eventType) => widgetApi.requestCapabilityToSendToDevice(eventType));
         capabilities.receiveToDevice?.forEach((eventType) => widgetApi.requestCapabilityToReceiveToDevice(eventType));
+        if (
+            capabilities.sendDelayedEvents &&
+            (capabilities.sendEvent?.length ||
+                capabilities.sendMessage === true ||
+                (Array.isArray(capabilities.sendMessage) && capabilities.sendMessage.length) ||
+                capabilities.sendState?.length)
+        ) {
+            widgetApi.requestCapability(MatrixCapabilities.MSC4157SendDelayedEvent);
+        }
+        if (capabilities.updateDelayedEvents) {
+            widgetApi.requestCapability(MatrixCapabilities.MSC4157UpdateDelayedEvent);
+        }
         if (capabilities.turnServers) {
             widgetApi.requestCapability(MatrixCapabilities.MSC3846TurnServers);
         }
@@ -151,6 +203,12 @@ export class RoomWidgetClient extends MatrixClient {
 
         // Open communication with the host
         widgetApi.start();
+        // Send a content loaded event now we've started the widget API
+        // Note that element-web currently does not use waitForIFrameLoad=false and so
+        // does *not* (yes, that is the right way around) wait for this event. Let's
+        // start sending this, then once this has rolled out, we can change element-web to
+        // use waitForIFrameLoad=false and have a widget API that's less racy.
+        if (sendContentLoaded) widgetApi.sendContentLoaded();
     }
 
     public async startClient(opts: IStartClientOpts = {}): Promise<void> {
@@ -192,8 +250,18 @@ export class RoomWidgetClient extends MatrixClient {
                 });
             }) ?? [],
         );
+
+        if (opts.clientWellKnownPollPeriod !== undefined) {
+            this.clientWellKnownIntervalID = setInterval(() => {
+                this.fetchClientWellKnown();
+            }, 1000 * opts.clientWellKnownPollPeriod);
+            this.fetchClientWellKnown();
+        }
+
         this.setSyncState(SyncState.Syncing);
         logger.info("Finished backfilling events");
+
+        this.matrixRTC.start();
 
         // Watch for TURN servers, if requested
         if (this.capabilities.turnServers) this.watchTurnServers();
@@ -212,7 +280,29 @@ export class RoomWidgetClient extends MatrixClient {
         throw new Error(`Unknown room: ${roomIdOrAlias}`);
     }
 
-    protected async encryptAndSendEvent(room: Room, event: MatrixEvent): Promise<ISendEventResponse> {
+    protected async encryptAndSendEvent(room: Room, event: MatrixEvent): Promise<ISendEventResponse>;
+    protected async encryptAndSendEvent(
+        room: Room,
+        event: MatrixEvent,
+        delayOpts: SendDelayedEventRequestOpts,
+    ): Promise<SendDelayedEventResponse>;
+    protected async encryptAndSendEvent(
+        room: Room,
+        event: MatrixEvent,
+        delayOpts?: SendDelayedEventRequestOpts,
+    ): Promise<ISendEventResponse | SendDelayedEventResponse> {
+        if (delayOpts) {
+            // TODO: updatePendingEvent for delayed events?
+            const response = await this.widgetApi.sendRoomEvent(
+                event.getType(),
+                event.getContent(),
+                room.roomId,
+                "delay" in delayOpts ? delayOpts.delay : undefined,
+                "parent_delay_id" in delayOpts ? delayOpts.parent_delay_id : undefined,
+            );
+            return this.validateSendDelayedEventResponse(response);
+        }
+
         let response: ISendEventFromWidgetResponseData;
         try {
             response = await this.widgetApi.sendRoomEvent(event.getType(), event.getContent(), room.roomId);
@@ -221,8 +311,9 @@ export class RoomWidgetClient extends MatrixClient {
             throw e;
         }
 
+        // This also checks for an event id on the response
         room.updatePendingEvent(event, EventStatus.SENT, response.event_id);
-        return { event_id: response.event_id };
+        return { event_id: response.event_id! };
     }
 
     public async sendStateEvent(
@@ -231,38 +322,96 @@ export class RoomWidgetClient extends MatrixClient {
         content: any,
         stateKey = "",
     ): Promise<ISendEventResponse> {
-        return await this.widgetApi.sendStateEvent(eventType, stateKey, content, roomId);
+        const response = await this.widgetApi.sendStateEvent(eventType, stateKey, content, roomId);
+        if (response.event_id === undefined) {
+            throw new Error("'event_id' absent from response to an event request");
+        }
+        return { event_id: response.event_id };
     }
 
-    public async sendToDevice(
-        eventType: string,
-        contentMap: { [userId: string]: { [deviceId: string]: Record<string, any> } },
-    ): Promise<{}> {
-        await this.widgetApi.sendToDevice(eventType, false, contentMap);
+    /**
+     * @experimental This currently relies on an unstable MSC (MSC4140).
+     */
+    // eslint-disable-next-line
+    public async _unstable_sendDelayedStateEvent<K extends keyof StateEvents>(
+        roomId: string,
+        delayOpts: SendDelayedEventRequestOpts,
+        eventType: K,
+        content: StateEvents[K],
+        stateKey = "",
+    ): Promise<SendDelayedEventResponse> {
+        if (!(await this.doesServerSupportUnstableFeature(UNSTABLE_MSC4140_DELAYED_EVENTS))) {
+            throw Error("Server does not support the delayed events API");
+        }
+
+        const response = await this.widgetApi.sendStateEvent(
+            eventType,
+            stateKey,
+            content,
+            roomId,
+            "delay" in delayOpts ? delayOpts.delay : undefined,
+            "parent_delay_id" in delayOpts ? delayOpts.parent_delay_id : undefined,
+        );
+        return this.validateSendDelayedEventResponse(response);
+    }
+
+    private validateSendDelayedEventResponse(response: ISendEventFromWidgetResponseData): SendDelayedEventResponse {
+        if (response.delay_id === undefined) {
+            throw new Error("'delay_id' absent from response to a delayed event request");
+        }
+        return { delay_id: response.delay_id };
+    }
+
+    /**
+     * @experimental This currently relies on an unstable MSC (MSC4140).
+     */
+    // eslint-disable-next-line
+    public async _unstable_updateDelayedEvent(delayId: string, action: UpdateDelayedEventAction): Promise<{}> {
+        if (!(await this.doesServerSupportUnstableFeature(UNSTABLE_MSC4140_DELAYED_EVENTS))) {
+            throw Error("Server does not support the delayed events API");
+        }
+
+        return await this.widgetApi.updateDelayedEvent(delayId, action);
+    }
+
+    public async sendToDevice(eventType: string, contentMap: SendToDeviceContentMap): Promise<{}> {
+        await this.widgetApi.sendToDevice(eventType, false, recursiveMapToObject(contentMap));
         return {};
     }
 
+    public async getOpenIdToken(): Promise<IOpenIDToken> {
+        const token = await this.widgetApi.requestOpenIDConnectToken();
+        // the IOpenIDCredentials from the widget-api and IOpenIDToken form the matrix-js-sdk are compatible.
+        // we still recreate the token to make this transparent and catch'able by the linter in case the types change in the future.
+        return <IOpenIDToken>{
+            access_token: token.access_token,
+            expires_in: token.expires_in,
+            matrix_server_name: token.matrix_server_name,
+            token_type: token.token_type,
+        };
+    }
+
     public async queueToDevice({ eventType, batch }: ToDeviceBatch): Promise<void> {
-        const contentMap: { [userId: string]: { [deviceId: string]: object } } = {};
+        // map: user Id → device Id → payload
+        const contentMap: MapWithDefault<string, Map<string, ToDevicePayload>> = new MapWithDefault(() => new Map());
         for (const { userId, deviceId, payload } of batch) {
-            if (!contentMap[userId]) contentMap[userId] = {};
-            contentMap[userId][deviceId] = payload;
+            contentMap.getOrCreate(userId).set(deviceId, payload);
         }
 
-        await this.widgetApi.sendToDevice(eventType, false, contentMap);
+        await this.widgetApi.sendToDevice(eventType, false, recursiveMapToObject(contentMap));
     }
 
     public async encryptAndSendToDevices(userDeviceInfoArr: IOlmDevice<DeviceInfo>[], payload: object): Promise<void> {
-        const contentMap: { [userId: string]: { [deviceId: string]: object } } = {};
+        // map: user Id → device Id → payload
+        const contentMap: MapWithDefault<string, Map<string, object>> = new MapWithDefault(() => new Map());
         for (const {
             userId,
             deviceInfo: { deviceId },
         } of userDeviceInfoArr) {
-            if (!contentMap[userId]) contentMap[userId] = {};
-            contentMap[userId][deviceId] = payload;
+            contentMap.getOrCreate(userId).set(deviceId, payload);
         }
 
-        await this.widgetApi.sendToDevice((payload as { type: string }).type, true, contentMap);
+        await this.widgetApi.sendToDevice((payload as { type: string }).type, true, recursiveMapToObject(contentMap));
     }
 
     // Overridden since we get TURN servers automatically over the widget API,

@@ -17,18 +17,19 @@ limitations under the License.
 import "../../olm-loader";
 import * as olmlib from "../../../src/crypto/olmlib";
 import { IObject } from "../../../src/crypto/olmlib";
-import { SECRET_STORAGE_ALGORITHM_V1_AES } from "../../../src/crypto/SecretStorage";
 import { MatrixEvent } from "../../../src/models/event";
 import { TestClient } from "../../TestClient";
 import { makeTestClients } from "./verification/util";
 import { encryptAES } from "../../../src/crypto/aes";
 import { createSecretStorageKey, resetCrossSigningKeys } from "./crypto-utils";
 import { logger } from "../../../src/logger";
-import { ClientEvent, ICreateClientOpts, ICrossSigningKey, MatrixClient } from "../../../src/client";
-import { ISecretStorageKeyInfo } from "../../../src/crypto/api";
+import { ClientEvent, ICreateClientOpts, MatrixClient } from "../../../src/client";
 import { DeviceInfo } from "../../../src/crypto/deviceinfo";
 import { ISignatures } from "../../../src/@types/signed";
 import { ICurve25519AuthData } from "../../../src/crypto/keybackup";
+import { SecretStorageKeyDescription, SECRET_STORAGE_ALGORITHM_V1_AES } from "../../../src/secret-storage";
+import { decodeBase64 } from "../../../src/base64";
+import { CrossSigningKeyInfo } from "../../../src/crypto-api";
 
 async function makeTestClient(
     userInfo: { userId: string; deviceId: string },
@@ -45,7 +46,7 @@ async function makeTestClient(
     await client.initCrypto();
 
     // No need to download keys for these tests
-    jest.spyOn(client.crypto!, "downloadKeys").mockResolvedValue({});
+    jest.spyOn(client.crypto!, "downloadKeys").mockResolvedValue(new Map());
 
     return client;
 }
@@ -149,22 +150,14 @@ describe("Secrets", function () {
     it("should throw if given a key that doesn't exist", async function () {
         const alice = await makeTestClient({ userId: "@alice:example.com", deviceId: "Osborne2" });
 
-        try {
-            await alice.storeSecret("foo", "bar", ["this secret does not exist"]);
-            // should be able to use expect(...).toThrow() but mocha still fails
-            // the test even when it throws for reasons I have no inclination to debug
-            expect(true).toBeFalsy();
-        } catch (e) {}
+        await expect(alice.storeSecret("foo", "bar", ["this secret does not exist"])).rejects.toBeTruthy();
         alice.stopClient();
     });
 
     it("should refuse to encrypt with zero keys", async function () {
         const alice = await makeTestClient({ userId: "@alice:example.com", deviceId: "Osborne2" });
 
-        try {
-            await alice.storeSecret("foo", "bar", []);
-            expect(true).toBeFalsy();
-        } catch (e) {}
+        await expect(alice.storeSecret("foo", "bar", [])).rejects.toBeTruthy();
         alice.stopClient();
     });
 
@@ -198,10 +191,7 @@ describe("Secrets", function () {
         };
         resetCrossSigningKeys(alice);
 
-        const { keyId: newKeyId } = await alice.addSecretStorageKey(SECRET_STORAGE_ALGORITHM_V1_AES, {
-            pubkey: undefined,
-            key: undefined,
-        });
+        const { keyId: newKeyId } = await alice.addSecretStorageKey(SECRET_STORAGE_ALGORITHM_V1_AES, { key });
         // we don't await on this because it waits for the event to come down the sync
         // which won't happen in the test setup
         alice.setDefaultSecretStorageKeyId(newKeyId);
@@ -215,10 +205,7 @@ describe("Secrets", function () {
     it("should refuse to encrypt if no keys given and no default key", async function () {
         const alice = await makeTestClient({ userId: "@alice:example.com", deviceId: "Osborne2" });
 
-        try {
-            await alice.storeSecret("foo", "bar");
-            expect(true).toBeFalsy();
-        } catch (e) {}
+        await expect(alice.storeSecret("foo", "bar")).rejects.toBeTruthy();
         alice.stopClient();
     });
 
@@ -274,7 +261,7 @@ describe("Secrets", function () {
             Object.values(otks)[0],
         );
 
-        osborne2.client.crypto!.deviceList.downloadKeys = () => Promise.resolve({});
+        osborne2.client.crypto!.deviceList.downloadKeys = () => Promise.resolve(new Map());
         osborne2.client.crypto!.deviceList.getUserByIdentityKey = () => "@alice:example.com";
 
         const request = await secretStorage.request("foo", ["VAX"]);
@@ -287,13 +274,13 @@ describe("Secrets", function () {
 
     describe("bootstrap", function () {
         // keys used in some of the tests
-        const XSK = new Uint8Array(olmlib.decodeBase64("3lo2YdJugHjfE+Or7KJ47NuKbhE7AAGLgQ/dc19913Q="));
+        const XSK = new Uint8Array(decodeBase64("3lo2YdJugHjfE+Or7KJ47NuKbhE7AAGLgQ/dc19913Q="));
         const XSPubKey = "DRb8pFVJyEJ9OWvXeUoM0jq/C2Wt+NxzBZVuk2nRb+0";
-        const USK = new Uint8Array(olmlib.decodeBase64("lKWi3hJGUie5xxHgySoz8PHFnZv6wvNaud/p2shN9VU="));
+        const USK = new Uint8Array(decodeBase64("lKWi3hJGUie5xxHgySoz8PHFnZv6wvNaud/p2shN9VU="));
         const USPubKey = "CUpoiTtHiyXpUmd+3ohb7JVxAlUaOG1NYs9Jlx8soQU";
-        const SSK = new Uint8Array(olmlib.decodeBase64("1R6JVlXX99UcfUZzKuCDGQgJTw8ur1/ofgPD8pp+96M="));
+        const SSK = new Uint8Array(decodeBase64("1R6JVlXX99UcfUZzKuCDGQgJTw8ur1/ofgPD8pp+96M="));
         const SSPubKey = "0DfNsRDzEvkCLA0gD3m7VAGJ5VClhjEsewI35xq873Q";
-        const SSSSKey = new Uint8Array(olmlib.decodeBase64("XrmITOOdBhw6yY5Bh7trb/bgp1FRdIGyCUxxMP873R0="));
+        const SSSSKey = new Uint8Array(decodeBase64("XrmITOOdBhw6yY5Bh7trb/bgp1FRdIGyCUxxMP873R0="));
 
         it("bootstraps when no storage or cross-signing keys locally", async function () {
             const key = new Uint8Array(16);
@@ -324,6 +311,7 @@ describe("Secrets", function () {
                 this.emit(ClientEvent.AccountData, event);
                 return {};
             };
+            bob.getKeyBackupVersion = jest.fn().mockResolvedValue(null);
 
             await bob.bootstrapCrossSigning({
                 authUploadDeviceSigningKeys: async (func) => {
@@ -345,7 +333,6 @@ describe("Secrets", function () {
 
         it("bootstraps when cross-signing keys in secret storage", async function () {
             const decryption = new global.Olm.PkDecryption();
-            const storagePublicKey = decryption.generate_key();
             const storagePrivateKey = decryption.get_private_key();
 
             const bob: MatrixClient = await makeTestClient(
@@ -388,8 +375,6 @@ describe("Secrets", function () {
             });
             await bob.bootstrapSecretStorage({
                 createSecretStorageKey: async () => ({
-                    // `pubkey` not used anymore with symmetric 4S
-                    keyInfo: { pubkey: storagePublicKey },
                     privateKey: storagePrivateKey,
                 }),
             });
@@ -491,7 +476,7 @@ describe("Secrets", function () {
                             [`ed25519:${XSPubKey}`]: XSPubKey,
                         },
                     },
-                    self_signing: sign<ICrossSigningKey>(
+                    self_signing: sign<CrossSigningKeyInfo>(
                         {
                             user_id: "@alice:example.com",
                             usage: ["self_signing"],
@@ -502,7 +487,7 @@ describe("Secrets", function () {
                         XSK,
                         "@alice:example.com",
                     ),
-                    user_signing: sign<ICrossSigningKey>(
+                    user_signing: sign<CrossSigningKeyInfo>(
                         {
                             user_id: "@alice:example.com",
                             usage: ["user_signing"],
@@ -541,7 +526,9 @@ describe("Secrets", function () {
             await alice.bootstrapSecretStorage({});
 
             expect(alice.getAccountData("m.secret_storage.default_key")!.getContent()).toEqual({ key: "key_id" });
-            const keyInfo = alice.getAccountData("m.secret_storage.key.key_id")!.getContent<ISecretStorageKeyInfo>();
+            const keyInfo = alice
+                .getAccountData("m.secret_storage.key.key_id")!
+                .getContent<SecretStorageKeyDescription>();
             expect(keyInfo.algorithm).toEqual("m.secret_storage.v1.aes-hmac-sha2");
             expect(keyInfo.passphrase).toEqual({
                 algorithm: "m.pbkdf2",
@@ -645,7 +632,7 @@ describe("Secrets", function () {
                             [`ed25519:${XSPubKey}`]: XSPubKey,
                         },
                     },
-                    self_signing: sign<ICrossSigningKey>(
+                    self_signing: sign<CrossSigningKeyInfo>(
                         {
                             user_id: "@alice:example.com",
                             usage: ["self_signing"],
@@ -656,7 +643,7 @@ describe("Secrets", function () {
                         XSK,
                         "@alice:example.com",
                     ),
-                    user_signing: sign<ICrossSigningKey>(
+                    user_signing: sign<CrossSigningKeyInfo>(
                         {
                             user_id: "@alice:example.com",
                             usage: ["user_signing"],

@@ -19,7 +19,6 @@ limitations under the License.
 import { MemoryStore, IOpts as IBaseOpts } from "./memory";
 import { LocalIndexedDBStoreBackend } from "./indexeddb-local-backend";
 import { RemoteIndexedDBStoreBackend } from "./indexeddb-remote-backend";
-import { User } from "../models/user";
 import { IEvent, MatrixEvent } from "../models/event";
 import { logger } from "../logger";
 import { ISavedSync } from "./index";
@@ -51,7 +50,12 @@ interface IOpts extends IBaseOpts {
 }
 
 type EventHandlerMap = {
+    // Fired when an IDB command fails on a degradable path, and the store falls back to MemoryStore
+    // This signals the potential for data volatility.
     degraded: (e: Error) => void;
+    // Fired when the IndexedDB gets closed unexpectedly, for example, if the underlying storage is removed or
+    // if the user clears the database in the browser's history preferences.
+    closed: () => void;
 };
 
 export class IndexedDBStore extends MemoryStore {
@@ -86,10 +90,10 @@ export class IndexedDBStore extends MemoryStore {
      * ```
      * let opts = { indexedDB: window.indexedDB, localStorage: window.localStorage };
      * let store = new IndexedDBStore(opts);
-     * await store.startup(); // load from indexed db
      * let client = sdk.createClient({
      *     store: store,
      * });
+     * await store.startup(); // load from indexed db, must be called after createClient
      * client.startClient();
      * client.on("sync", function(state, prevState, data) {
      *     if (state === "PREPARED") {
@@ -127,7 +131,7 @@ export class IndexedDBStore extends MemoryStore {
 
         logger.log(`IndexedDBStore.startup: connecting to backend`);
         return this.backend
-            .connect()
+            .connect(this.onClose)
             .then(() => {
                 logger.log(`IndexedDBStore.startup: loading presence events`);
                 return this.backend.getUserPresenceEvents();
@@ -135,15 +139,32 @@ export class IndexedDBStore extends MemoryStore {
             .then((userPresenceEvents) => {
                 logger.log(`IndexedDBStore.startup: processing presence events`);
                 userPresenceEvents.forEach(([userId, rawEvent]) => {
-                    const u = new User(userId);
+                    if (!this.createUser) {
+                        throw new Error(
+                            "`IndexedDBStore.startup` must be called after assigning it to the client, not before!",
+                        );
+                    }
+                    const u = this.createUser(userId);
                     if (rawEvent) {
                         u.setPresenceEvent(new MatrixEvent(rawEvent));
                     }
                     this.userModifiedMap[u.userId] = u.getLastModifiedTime();
                     this.storeUser(u);
                 });
+                this.startedUp = true;
             });
     }
+
+    /*
+     * Close the database and destroy any associated workers
+     */
+    public destroy(): Promise<void> {
+        return this.backend.destroy();
+    }
+
+    private onClose = (): void => {
+        this.emitter.emit("closed");
+    };
 
     /**
      * @returns Promise which resolves with a sync response to restore the

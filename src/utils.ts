@@ -22,9 +22,10 @@ import unhomoglyph from "unhomoglyph";
 import promiseRetry from "p-retry";
 import { Optional } from "matrix-events-sdk";
 
-import { MatrixEvent } from "./models/event";
+import { IEvent, MatrixEvent } from "./models/event";
 import { M_TIMESTAMP } from "./@types/location";
 import { ReceiptType } from "./@types/read_receipts";
+import { BaseLogger } from "./logger";
 
 const interns = new Map<string, string>();
 
@@ -357,27 +358,14 @@ export function escapeRegExp(string: string): string {
     return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function globToRegexp(glob: string, extended = false): string {
-    // From
-    // https://github.com/matrix-org/synapse/blob/abbee6b29be80a77e05730707602f3bbfc3f38cb/synapse/push/__init__.py#L132
-    // Because micromatch is about 130KB with dependencies,
-    // and minimatch is not much better.
-    const replacements: [RegExp, string | ((substring: string, ...args: any[]) => string)][] = [
-        [/\\\*/g, ".*"],
-        [/\?/g, "."],
-    ];
-    if (!extended) {
-        replacements.push([
-            /\\\[(!|)(.*)\\]/g,
-            (_match: string, neg: string, pat: string): string =>
-                ["[", neg ? "^" : "", pat.replace(/\\-/, "-"), "]"].join(""),
-        ]);
-    }
-    return replacements.reduce(
-        // https://github.com/microsoft/TypeScript/issues/30134
-        (pat, args) => (args ? pat.replace(args[0], args[1] as any) : pat),
-        escapeRegExp(glob),
-    );
+/**
+ * Converts Matrix glob-style string to a regular expression
+ * https://spec.matrix.org/v1.7/appendices/#glob-style-matching
+ * @param glob - Matrix glob-style string
+ * @returns regular expression
+ */
+export function globToRegexp(glob: string): string {
+    return escapeRegExp(glob).replace(/\\\*/g, ".*").replace(/\?/g, ".");
 }
 
 export function ensureNoTrailingSlash(url: string): string;
@@ -401,10 +389,30 @@ export function sleep<T>(ms: number, value?: T): Promise<T> {
 }
 
 /**
+ * Utility to log the duration of a promise.
+ *
+ * @param logger - The logger to log to.
+ * @param name - The name of the operation.
+ * @param block - The block to execute.
+ */
+export async function logDuration<T>(logger: BaseLogger, name: string, block: () => Promise<T>): Promise<T> {
+    const start = Date.now();
+    try {
+        return await block();
+    } finally {
+        const end = Date.now();
+        logger.debug(`[Perf]: ${name} took ${end - start}ms`);
+    }
+}
+
+/**
  * Promise/async version of {@link setImmediate}.
+ *
+ * Implementation is based on `setTimeout` for wider compatibility.
+ * @deprecated Use {@link sleep} instead.
  */
 export function immediate(): Promise<void> {
-    return new Promise(setImmediate);
+    return new Promise((resolve) => setTimeout(resolve));
 }
 
 export function isNullOrUndefined(val: any): boolean {
@@ -641,16 +649,6 @@ export function lexicographicCompare(a: string, b: string): number {
     }
 }
 
-const collator = new Intl.Collator();
-/**
- * Performant language-sensitive string comparison
- * @param a - the first string to compare
- * @param b - the second string to compare
- */
-export function compare(a: string, b: string): number {
-    return collator.compare(a, b);
-}
-
 /**
  * This function is similar to Object.assign() but it assigns recursively and
  * allows you to ignore nullish values from the source
@@ -668,7 +666,7 @@ export function recursivelyAssign<T1 extends T2, T2 extends Record<string, any>>
             continue;
         }
         if ((sourceValue !== null && sourceValue !== undefined) || !ignoreNullish) {
-            target[sourceKey as keyof T1] = sourceValue;
+            safeSet(target, sourceKey, sourceValue);
             continue;
         }
     }
@@ -702,4 +700,64 @@ export function mapsEqual<K, V>(x: Map<K, V>, y: Map<K, V>, eq = (v1: V, v2: V):
         if (v2 === undefined || !eq(v1, v2)) return false;
     }
     return true;
+}
+
+function processMapToObjectValue(value: any): any {
+    if (value instanceof Map) {
+        // Value is a Map. Recursively map it to an object.
+        return recursiveMapToObject(value);
+    } else if (Array.isArray(value)) {
+        // Value is an Array. Recursively map the value (e.g. to cover Array of Arrays).
+        return value.map((v) => processMapToObjectValue(v));
+    } else {
+        return value;
+    }
+}
+
+/**
+ * Recursively converts Maps to plain objects.
+ * Also supports sub-lists of Maps.
+ */
+export function recursiveMapToObject(map: Map<any, any>): Record<any, any> {
+    const targetMap = new Map();
+
+    for (const [key, value] of map) {
+        targetMap.set(key, processMapToObjectValue(value));
+    }
+
+    return Object.fromEntries(targetMap.entries());
+}
+
+export function unsafeProp<K extends keyof any | undefined>(prop: K): boolean {
+    return prop === "__proto__" || prop === "prototype" || prop === "constructor";
+}
+
+export function safeSet<O extends Record<any, any>, K extends keyof O>(obj: O, prop: K, value: O[K]): void {
+    if (unsafeProp(prop)) {
+        throw new Error("Trying to modify prototype or constructor");
+    }
+
+    obj[prop] = value;
+}
+
+export function noUnsafeEventProps(event: Partial<IEvent>): boolean {
+    return !(unsafeProp(event.room_id) || unsafeProp(event.sender) || unsafeProp(event.event_id));
+}
+
+export class MapWithDefault<K, V> extends Map<K, V> {
+    public constructor(private createDefault: () => V) {
+        super();
+    }
+
+    /**
+     * Returns the value if the key already exists.
+     * If not, it creates a new value under that key using the ctor callback and returns it.
+     */
+    public getOrCreate(key: K): V {
+        if (!this.has(key)) {
+            this.set(key, this.createDefault());
+        }
+
+        return this.get(key)!;
+    }
 }

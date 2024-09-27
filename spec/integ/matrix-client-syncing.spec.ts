@@ -36,11 +36,19 @@ import {
     NotificationCountType,
     IEphemeral,
     Room,
+    IndexedDBStore,
+    RelationType,
+    EventType,
+    MatrixEventEvent,
 } from "../../src";
 import { ReceiptType } from "../../src/@types/read_receipts";
 import { UNREAD_THREAD_NOTIFICATIONS } from "../../src/@types/sync";
 import * as utils from "../test-utils/test-utils";
 import { TestClient } from "../TestClient";
+import { emitPromise, mkEvent, mkMessage } from "../test-utils/test-utils";
+import { THREAD_RELATION_TYPE } from "../../src/models/thread";
+import { IActionsObject } from "../../src/pushprocessor";
+import { KnownMembership } from "../../src/@types/membership";
 
 describe("MatrixClient syncing", () => {
     const selfUserId = "@alice:localhost";
@@ -81,17 +89,15 @@ describe("MatrixClient syncing", () => {
             presence: {},
         };
 
-        it("should /sync after /pushrules and /filter.", (done) => {
+        it("should /sync after /pushrules and /filter.", async () => {
             httpBackend!.when("GET", "/sync").respond(200, syncData);
 
             client!.startClient();
 
-            httpBackend!.flushAllExpected().then(() => {
-                done();
-            });
+            await httpBackend!.flushAllExpected();
         });
 
-        it("should pass the 'next_batch' token from /sync to the since= param  of the next /sync", (done) => {
+        it("should pass the 'next_batch' token from /sync to the since= param  of the next /sync", async () => {
             httpBackend!.when("GET", "/sync").respond(200, syncData);
             httpBackend!
                 .when("GET", "/sync")
@@ -102,9 +108,7 @@ describe("MatrixClient syncing", () => {
 
             client!.startClient();
 
-            httpBackend!.flushAllExpected().then(() => {
-                done();
-            });
+            await httpBackend!.flushAllExpected();
         });
 
         it("should emit RoomEvent.MyMembership for invite->leave->invite cycles", async () => {
@@ -122,7 +126,7 @@ describe("MatrixClient syncing", () => {
                                     type: "m.room.member",
                                     state_key: selfUserId,
                                     content: {
-                                        membership: "invite",
+                                        membership: KnownMembership.Invite,
                                     },
                                 },
                             ],
@@ -150,10 +154,10 @@ describe("MatrixClient syncing", () => {
                                         type: "m.room.member",
                                         state_key: selfUserId,
                                         content: {
-                                            membership: "leave",
+                                            membership: KnownMembership.Leave,
                                         },
                                         prev_content: {
-                                            membership: "invite",
+                                            membership: KnownMembership.Invite,
                                         },
                                         // XXX: And other fields required on an event
                                     },
@@ -166,10 +170,10 @@ describe("MatrixClient syncing", () => {
                                         type: "m.room.member",
                                         state_key: selfUserId,
                                         content: {
-                                            membership: "leave",
+                                            membership: KnownMembership.Leave,
                                         },
                                         prev_content: {
-                                            membership: "invite",
+                                            membership: KnownMembership.Invite,
                                         },
                                         // XXX: And other fields required on an event
                                     },
@@ -192,22 +196,137 @@ describe("MatrixClient syncing", () => {
                 // Room, string, string
                 fires++;
                 expect(room.roomId).toBe(roomId);
-                expect(membership).toBe("invite");
+                expect(membership).toBe(KnownMembership.Invite);
                 expect(oldMembership).toBeFalsy();
 
                 // Second fire: a leave
                 client!.once(RoomEvent.MyMembership, (room, membership, oldMembership) => {
                     fires++;
                     expect(room.roomId).toBe(roomId);
-                    expect(membership).toBe("leave");
-                    expect(oldMembership).toBe("invite");
+                    expect(membership).toBe(KnownMembership.Leave);
+                    expect(oldMembership).toBe(KnownMembership.Invite);
 
                     // Third/final fire: a second invite
                     client!.once(RoomEvent.MyMembership, (room, membership, oldMembership) => {
                         fires++;
                         expect(room.roomId).toBe(roomId);
-                        expect(membership).toBe("invite");
-                        expect(oldMembership).toBe("leave");
+                        expect(membership).toBe(KnownMembership.Invite);
+                        expect(oldMembership).toBe(KnownMembership.Leave);
+                    });
+                });
+
+                // For maximum safety, "leave" the room after we register the handler
+                client!.leave(roomId);
+            });
+
+            // noinspection ES6MissingAwait
+            client!.startClient();
+            await httpBackend!.flushAllExpected();
+
+            expect(fires).toBe(3);
+        });
+
+        it("should emit RoomEvent.MyMembership for knock->leave->knock cycles", async () => {
+            await client!.initCrypto();
+
+            const roomId = "!cycles:example.org";
+
+            // First sync: an knock
+            const knockSyncRoomSection = {
+                knock: {
+                    [roomId]: {
+                        knock_state: {
+                            events: [
+                                {
+                                    type: "m.room.member",
+                                    state_key: selfUserId,
+                                    content: {
+                                        membership: KnownMembership.Knock,
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            };
+            httpBackend!.when("GET", "/sync").respond(200, {
+                ...syncData,
+                rooms: knockSyncRoomSection,
+            });
+
+            // Second sync: a leave (reject of some kind)
+            httpBackend!.when("POST", "/leave").respond(200, {});
+            httpBackend!.when("GET", "/sync").respond(200, {
+                ...syncData,
+                rooms: {
+                    leave: {
+                        [roomId]: {
+                            account_data: { events: [] },
+                            ephemeral: { events: [] },
+                            state: {
+                                events: [
+                                    {
+                                        type: "m.room.member",
+                                        state_key: selfUserId,
+                                        content: {
+                                            membership: KnownMembership.Leave,
+                                        },
+                                        prev_content: {
+                                            membership: KnownMembership.Knock,
+                                        },
+                                        // XXX: And other fields required on an event
+                                    },
+                                ],
+                            },
+                            timeline: {
+                                limited: false,
+                                events: [
+                                    {
+                                        type: "m.room.member",
+                                        state_key: selfUserId,
+                                        content: {
+                                            membership: KnownMembership.Leave,
+                                        },
+                                        prev_content: {
+                                            membership: KnownMembership.Knock,
+                                        },
+                                        // XXX: And other fields required on an event
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+            });
+
+            // Third sync: another knock
+            httpBackend!.when("GET", "/sync").respond(200, {
+                ...syncData,
+                rooms: knockSyncRoomSection,
+            });
+
+            // First fire: an initial knock
+            let fires = 0;
+            client!.once(RoomEvent.MyMembership, (room, membership, oldMembership) => {
+                // Room, string, string
+                fires++;
+                expect(room.roomId).toBe(roomId);
+                expect(membership).toBe(KnownMembership.Knock);
+                expect(oldMembership).toBeFalsy();
+
+                // Second fire: a leave
+                client!.once(RoomEvent.MyMembership, (room, membership, oldMembership) => {
+                    fires++;
+                    expect(room.roomId).toBe(roomId);
+                    expect(membership).toBe(KnownMembership.Leave);
+                    expect(oldMembership).toBe(KnownMembership.Knock);
+
+                    // Third/final fire: a second knock
+                    client!.once(RoomEvent.MyMembership, (room, membership, oldMembership) => {
+                        fires++;
+                        expect(room.roomId).toBe(roomId);
+                        expect(membership).toBe(KnownMembership.Knock);
+                        expect(oldMembership).toBe(KnownMembership.Leave);
                     });
                 });
 
@@ -223,8 +342,6 @@ describe("MatrixClient syncing", () => {
         });
 
         it("should honour lazyLoadMembers if user is not a guest", () => {
-            client!.doesServerSupportLazyLoading = jest.fn().mockResolvedValue(true);
-
             httpBackend!
                 .when("GET", "/sync")
                 .check((req) => {
@@ -241,8 +358,6 @@ describe("MatrixClient syncing", () => {
         it("should not honour lazyLoadMembers if user is a guest", () => {
             httpBackend!.expectedRequests = [];
             httpBackend!.when("GET", "/versions").respond(200, {});
-            client!.doesServerSupportLazyLoading = jest.fn().mockResolvedValue(true);
-
             httpBackend!
                 .when("GET", "/sync")
                 .check((req) => {
@@ -269,7 +384,7 @@ describe("MatrixClient syncing", () => {
                                     type: "m.room.member",
                                     state_key: selfUserId,
                                     content: {
-                                        membership: "invite",
+                                        membership: KnownMembership.Invite,
                                     },
                                 },
                             ],
@@ -283,6 +398,46 @@ describe("MatrixClient syncing", () => {
             });
 
             // First fire: an initial invite
+            let fires = 0;
+            client!.once(ClientEvent.Room, (room) => {
+                fires++;
+                expect(room.roomId).toBe(roomId);
+            });
+
+            // noinspection ES6MissingAwait
+            client!.startClient();
+            await httpBackend!.flushAllExpected();
+
+            expect(fires).toBe(1);
+        });
+
+        it("should emit ClientEvent.Room when knocked while crypto is disabled", async () => {
+            const roomId = "!knock:example.org";
+
+            // First sync: a knock
+            const knockSyncRoomSection = {
+                knock: {
+                    [roomId]: {
+                        knock_state: {
+                            events: [
+                                {
+                                    type: "m.room.member",
+                                    state_key: selfUserId,
+                                    content: {
+                                        membership: KnownMembership.Knock,
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            };
+            httpBackend!.when("GET", "/sync").respond(200, {
+                ...syncData,
+                rooms: knockSyncRoomSection,
+            });
+
+            // First fire: an initial knock
             let fires = 0;
             client!.once(ClientEvent.Room, (room) => {
                 fires++;
@@ -361,6 +516,7 @@ describe("MatrixClient syncing", () => {
                 join: {},
                 invite: {},
                 leave: {},
+                knock: {},
             },
         };
 
@@ -380,21 +536,19 @@ describe("MatrixClient syncing", () => {
                     events: [
                         utils.mkMembership({
                             room: roomOne,
-                            mship: "join",
+                            mship: KnownMembership.Join,
                             user: otherUserId,
                         }),
                         utils.mkMembership({
                             room: roomOne,
-                            mship: "join",
+                            mship: KnownMembership.Join,
                             user: selfUserId,
                         }),
                         utils.mkEvent({
                             type: "m.room.create",
                             room: roomOne,
                             user: selfUserId,
-                            content: {
-                                creator: selfUserId,
-                            },
+                            content: {},
                         }),
                     ],
                 },
@@ -405,7 +559,7 @@ describe("MatrixClient syncing", () => {
             syncData.rooms.join[roomOne].state.events.push(
                 utils.mkMembership({
                     room: roomOne,
-                    mship: "invite",
+                    mship: KnownMembership.Invite,
                     user: userC,
                 }) as IStateEvent,
             );
@@ -438,7 +592,7 @@ describe("MatrixClient syncing", () => {
             syncData.rooms.join[roomOne].state.events.push(
                 utils.mkMembership({
                     room: roomOne,
-                    mship: "invite",
+                    mship: KnownMembership.Invite,
                     user: userC,
                 }) as IStateEvent,
             );
@@ -466,7 +620,7 @@ describe("MatrixClient syncing", () => {
             syncData.rooms.join[roomOne].state.events.push(
                 utils.mkMembership({
                     room: roomOne,
-                    mship: "invite",
+                    mship: KnownMembership.Invite,
                     user: userC,
                 }) as IStateEvent,
             );
@@ -493,7 +647,7 @@ describe("MatrixClient syncing", () => {
             syncData.rooms.join[roomOne].state.events.push(
                 utils.mkMembership({
                     room: roomOne,
-                    mship: "invite",
+                    mship: KnownMembership.Invite,
                     user: userC,
                 }) as IStateEvent,
             );
@@ -568,21 +722,19 @@ describe("MatrixClient syncing", () => {
                                 }),
                                 utils.mkMembership({
                                     room: roomOne,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: otherUserId,
                                 }),
                                 utils.mkMembership({
                                     room: roomOne,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: selfUserId,
                                 }),
                                 utils.mkEvent({
                                     type: "m.room.create",
                                     room: roomOne,
                                     user: selfUserId,
-                                    content: {
-                                        creator: selfUserId,
-                                    },
+                                    content: {},
                                 }),
                             ],
                         },
@@ -601,22 +753,20 @@ describe("MatrixClient syncing", () => {
                             events: [
                                 utils.mkMembership({
                                     room: roomTwo,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: otherUserId,
                                     name: otherDisplayName,
                                 }),
                                 utils.mkMembership({
                                     room: roomTwo,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: selfUserId,
                                 }),
                                 utils.mkEvent({
                                     type: "m.room.create",
                                     room: roomTwo,
                                     user: selfUserId,
-                                    content: {
-                                        creator: selfUserId,
-                                    },
+                                    content: {},
                                 }),
                             ],
                         },
@@ -724,7 +874,7 @@ describe("MatrixClient syncing", () => {
         // events that arrive in the incremental sync as if they preceeded the
         // timeline events, however this breaks peeking, so it's disabled
         // (see sync.js)
-        xit("should correctly interpret state in incremental sync.", () => {
+        it.skip("should correctly interpret state in incremental sync.", () => {
             httpBackend!.when("GET", "/sync").respond(200, syncData);
             httpBackend!.when("GET", "/sync").respond(200, nextSyncData);
 
@@ -741,9 +891,9 @@ describe("MatrixClient syncing", () => {
             });
         });
 
-        xit("should update power levels for users in a room", () => {});
+        it.skip("should update power levels for users in a room", () => {});
 
-        xit("should update the room topic", () => {});
+        it.skip("should update the room topic", () => {});
 
         describe("onMarkerStateEvent", () => {
             const normalMessageEvent = utils.mkMessage({
@@ -761,7 +911,6 @@ describe("MatrixClient syncing", () => {
                         room: roomOne,
                         user: otherUserId,
                         content: {
-                            creator: otherUserId,
                             room_version: "9",
                         },
                     });
@@ -840,13 +989,13 @@ describe("MatrixClient syncing", () => {
                     roomVersion: "org.matrix.msc2716v3",
                 },
             ].forEach((testMeta) => {
+                // eslint-disable-next-line jest/valid-title
                 describe(testMeta.label, () => {
                     const roomCreateEvent = utils.mkEvent({
                         type: "m.room.create",
                         room: roomOne,
                         user: otherUserId,
                         content: {
-                            creator: otherUserId,
                             room_version: testMeta.roomVersion,
                         },
                     });
@@ -1101,7 +1250,7 @@ describe("MatrixClient syncing", () => {
 
             const USER_MEMBERSHIP_EVENT = utils.mkMembership({
                 room: roomOne,
-                mship: "join",
+                mship: KnownMembership.Join,
                 user: userA,
             });
 
@@ -1362,21 +1511,19 @@ describe("MatrixClient syncing", () => {
                                 }),
                                 utils.mkMembership({
                                     room: roomOne,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: otherUserId,
                                 }),
                                 utils.mkMembership({
                                     room: roomOne,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: selfUserId,
                                 }),
                                 utils.mkEvent({
                                     type: "m.room.create",
                                     room: roomOne,
                                     user: selfUserId,
-                                    content: {
-                                        creator: selfUserId,
-                                    },
+                                    content: {},
                                 }),
                             ],
                         } as Partial<IJoinedRoom>,
@@ -1461,21 +1608,19 @@ describe("MatrixClient syncing", () => {
                                 }),
                                 utils.mkMembership({
                                     room: roomOne,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: otherUserId,
                                 }),
                                 utils.mkMembership({
                                     room: roomOne,
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: selfUserId,
                                 }),
                                 utils.mkEvent({
                                     type: "m.room.create",
                                     room: roomOne,
                                     user: selfUserId,
-                                    content: {
-                                        creator: selfUserId,
-                                    },
+                                    content: {},
                                 }),
                             ],
                         },
@@ -1501,6 +1646,99 @@ describe("MatrixClient syncing", () => {
                 expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Total)).toBe(5);
                 expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Highlight)).toBe(2);
             });
+        });
+
+        it("should zero total notifications for threads when absent from the notifications object", async () => {
+            syncData.rooms.join[roomOne][UNREAD_THREAD_NOTIFICATIONS.name] = {
+                [THREAD_ID]: {
+                    highlight_count: 2,
+                    notification_count: 5,
+                },
+            };
+
+            httpBackend!.when("GET", "/sync").respond(200, syncData);
+
+            client!.startClient();
+
+            await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+            const room = client!.getRoom(roomOne);
+
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Total)).toBe(5);
+
+            syncData.rooms.join[roomOne][UNREAD_THREAD_NOTIFICATIONS.name] = {};
+
+            httpBackend!.when("GET", "/sync").respond(200, syncData);
+
+            await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Total)).toBe(0);
+        });
+
+        it("should zero highlight notifications for threads in encrypted rooms", async () => {
+            syncData.rooms.join[roomOne][UNREAD_THREAD_NOTIFICATIONS.name] = {
+                [THREAD_ID]: {
+                    highlight_count: 2,
+                    notification_count: 5,
+                },
+            };
+
+            httpBackend!.when("GET", "/sync").respond(200, syncData);
+
+            client!.startClient();
+
+            await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+            const room = client!.getRoom(roomOne);
+
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Total)).toBe(5);
+
+            syncData.rooms.join[roomOne][UNREAD_THREAD_NOTIFICATIONS.name] = {
+                [THREAD_ID]: {
+                    highlight_count: 0,
+                    notification_count: 0,
+                },
+            };
+
+            httpBackend!.when("GET", "/sync").respond(200, syncData);
+
+            await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Highlight)).toBe(0);
+        });
+
+        it("should not zero highlight notifications for threads in encrypted rooms", async () => {
+            syncData.rooms.join[roomOne][UNREAD_THREAD_NOTIFICATIONS.name] = {
+                [THREAD_ID]: {
+                    highlight_count: 2,
+                    notification_count: 5,
+                },
+            };
+
+            httpBackend!.when("GET", "/sync").respond(200, syncData);
+
+            client!.startClient();
+
+            await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+            const room = client!.getRoom(roomOne);
+            room!.hasEncryptionStateEvent = jest.fn().mockReturnValue(true);
+
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Total)).toBe(5);
+
+            syncData.rooms.join[roomOne][UNREAD_THREAD_NOTIFICATIONS.name] = {
+                [THREAD_ID]: {
+                    highlight_count: 0,
+                    notification_count: 0,
+                },
+            };
+
+            httpBackend!.when("GET", "/sync").respond(200, syncData);
+
+            await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Total)).toBe(0);
+            expect(room!.getThreadUnreadNotificationCount(THREAD_ID, NotificationCountType.Highlight)).toBe(2);
         });
 
         it("caches unknown threads receipts and replay them when the thread is created", async () => {
@@ -1589,30 +1827,374 @@ describe("MatrixClient syncing", () => {
                 });
             });
         });
+
+        describe("encrypted notification logic", () => {
+            let roomId: string;
+            let syncData: ISyncResponse;
+
+            beforeEach(() => {
+                roomId = "!room123:server";
+                syncData = {
+                    rooms: {
+                        join: {
+                            [roomId]: {
+                                ephemeral: {
+                                    events: [],
+                                },
+                                timeline: {
+                                    events: [
+                                        utils.mkEvent({
+                                            room: roomId,
+                                            event: true,
+                                            skey: "",
+                                            type: EventType.RoomEncryption,
+                                            content: {},
+                                        }),
+                                        utils.mkMessage({
+                                            room: roomId,
+                                            user: otherUserId,
+                                            msg: "hello",
+                                        }),
+                                    ],
+                                },
+                                state: {
+                                    events: [
+                                        utils.mkMembership({
+                                            room: roomId,
+                                            mship: KnownMembership.Join,
+                                            user: otherUserId,
+                                        }),
+                                        utils.mkMembership({
+                                            room: roomId,
+                                            mship: KnownMembership.Join,
+                                            user: selfUserId,
+                                        }),
+                                        utils.mkEvent({
+                                            type: "m.room.create",
+                                            room: roomId,
+                                            user: selfUserId,
+                                            content: {},
+                                        }),
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                } as unknown as ISyncResponse;
+            });
+
+            it("should apply encrypted notification logic for events within the same sync blob", async () => {
+                httpBackend!.when("GET", "/sync").respond(200, syncData);
+                client!.startClient();
+
+                await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+                const room = client!.getRoom(roomId)!;
+                expect(room).toBeInstanceOf(Room);
+                expect(room.getRoomUnreadNotificationCount(NotificationCountType.Total)).toBe(0);
+            });
+
+            it("should recalculate highlights on unthreaded receipt for encrypted rooms", async () => {
+                const myUserId = client!.getUserId()!;
+
+                const firstEventId = syncData.rooms.join[roomId].timeline.events[1].event_id;
+
+                // add a receipt for the first event in the room (let's say the user has already read that one)
+                syncData.rooms.join[roomId].ephemeral.events = [
+                    {
+                        content: {
+                            [firstEventId]: {
+                                "m.read": {
+                                    [myUserId]: { ts: 1 },
+                                },
+                            },
+                        },
+                        type: "m.receipt",
+                    },
+                ];
+
+                // Now add a highlighting event after that receipt
+                const pingEvent = utils.mkMessage({
+                    room: roomId,
+                    user: otherUserId,
+                    msg: client?.getUserId() + " ping",
+                }) as IRoomEvent;
+                syncData.rooms.join[roomId].timeline.events.push(pingEvent);
+
+                // fudge this to make it a highlight
+                client!.getPushActionsForEvent = (ev: MatrixEvent): IActionsObject | null => {
+                    if (ev.getId() === pingEvent.event_id) {
+                        return {
+                            notify: true,
+                            tweaks: {
+                                highlight: true,
+                            },
+                        };
+                    }
+                    return null;
+                };
+
+                httpBackend!.when("GET", "/sync").respond(200, syncData);
+                client!.startClient();
+
+                await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+                const room = client!.getRoom(roomId)!;
+                expect(room).toBeInstanceOf(Room);
+                // the room should now have one highlight since our receipt was before the ping message
+                expect(room.getRoomUnreadNotificationCount(NotificationCountType.Highlight)).toBe(1);
+            });
+
+            it("should recalculate highlights on main thread receipt for encrypted rooms", async () => {
+                const myUserId = client!.getUserId()!;
+
+                const firstEventId = syncData.rooms.join[roomId].timeline.events[1].event_id;
+
+                // add a receipt for the first event in the room (let's say the user has already read that one)
+                syncData.rooms.join[roomId].ephemeral.events = [
+                    {
+                        content: {
+                            [firstEventId]: {
+                                "m.read": {
+                                    [myUserId]: { ts: 1, thread_id: "main" },
+                                },
+                            },
+                        },
+                        type: "m.receipt",
+                    },
+                ];
+
+                // Now add a highlighting event after that receipt
+                const pingEvent = utils.mkMessage({
+                    room: roomId,
+                    user: otherUserId,
+                    msg: client?.getUserId() + " ping",
+                }) as IRoomEvent;
+                syncData.rooms.join[roomId].timeline.events.push(pingEvent);
+
+                // fudge this to make it a highlight
+                client!.getPushActionsForEvent = (ev: MatrixEvent): IActionsObject | null => {
+                    if (ev.getId() === pingEvent.event_id) {
+                        return {
+                            notify: true,
+                            tweaks: {
+                                highlight: true,
+                            },
+                        };
+                    }
+                    return null;
+                };
+
+                httpBackend!.when("GET", "/sync").respond(200, syncData);
+                client!.startClient();
+
+                await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+                const room = client!.getRoom(roomId)!;
+                expect(room).toBeInstanceOf(Room);
+                // the room should now have one highlight since our receipt was before the ping message
+                expect(room.getRoomUnreadNotificationCount(NotificationCountType.Highlight)).toBe(1);
+            });
+
+            describe("notification processing in threads", () => {
+                let threadEvent1: IRoomEvent;
+                let threadEvent2: IRoomEvent;
+                let firstEventId: string;
+
+                beforeEach(() => {
+                    firstEventId = syncData.rooms.join[roomId].timeline.events[1].event_id;
+
+                    // Add a threaded event off of the first event
+                    threadEvent1 = utils.mkEvent({
+                        type: EventType.RoomMessage,
+                        user: otherUserId,
+                        room: roomId,
+                        ts: 500,
+                        content: {
+                            "body": "first thread response",
+                            "m.relates_to": {
+                                "event_id": firstEventId,
+                                "m.in_reply_to": {
+                                    event_id: firstEventId,
+                                },
+                                "rel_type": "io.element.thread",
+                            },
+                        },
+                    }) as IRoomEvent;
+                    syncData.rooms.join[roomId].timeline.events.push(threadEvent1);
+
+                    // ...and another
+                    threadEvent2 = utils.mkEvent({
+                        type: EventType.RoomMessage,
+                        user: otherUserId,
+                        room: roomId,
+                        ts: 1500,
+                        content: {
+                            "body": "second thread response",
+                            "m.relates_to": {
+                                "event_id": firstEventId,
+                                "m.in_reply_to": {
+                                    event_id: firstEventId,
+                                },
+                                "rel_type": "io.element.thread",
+                            },
+                        },
+                    }) as IRoomEvent;
+                    syncData.rooms.join[roomId].timeline.events.push(threadEvent2);
+
+                    // fudge to make these highlights
+                    client!.getPushActionsForEvent = (ev: MatrixEvent): IActionsObject | null => {
+                        if ([threadEvent1.event_id, threadEvent2.event_id].includes(ev.getId()!)) {
+                            return {
+                                notify: true,
+                                tweaks: {
+                                    highlight: true,
+                                },
+                            };
+                        }
+                        return null;
+                    };
+                });
+
+                it("checks threads with notifications on unthreaded receipts", async () => {
+                    const myUserId = client!.getUserId()!;
+
+                    // add a receipt for a random, ficticious thread, otherwise the client will
+                    // think that the thread is before any threaded receipts and ignore it.
+                    syncData.rooms.join[roomId].ephemeral.events = [
+                        {
+                            content: {
+                                [firstEventId]: {
+                                    "m.read": {
+                                        [myUserId]: { ts: 1, thread_id: "some_other_thread" },
+                                    },
+                                },
+                            },
+                            type: "m.receipt",
+                        },
+                    ];
+
+                    httpBackend!.when("GET", "/sync").respond(200, syncData);
+                    client!.startClient({ threadSupport: true });
+
+                    await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+                    const room = client!.getRoom(roomId)!;
+
+                    // pretend that the client has decrypted an event to trigger it to compute
+                    // local notifications
+                    client?.emit(MatrixEventEvent.Decrypted, room.findEventById(firstEventId)!);
+                    client?.emit(MatrixEventEvent.Decrypted, room.findEventById(threadEvent1.event_id)!);
+                    client?.emit(MatrixEventEvent.Decrypted, room.findEventById(threadEvent2.event_id)!);
+
+                    expect(room).toBeInstanceOf(Room);
+
+                    // we should now have one highlight: the unread message that pings
+                    expect(
+                        room.getThreadUnreadNotificationCount(firstEventId, NotificationCountType.Highlight),
+                    ).toEqual(2);
+
+                    const syncData2 = {
+                        rooms: {
+                            join: {
+                                [roomId]: {
+                                    ephemeral: {
+                                        events: [
+                                            {
+                                                content: {
+                                                    [firstEventId]: {
+                                                        "m.read": {
+                                                            [myUserId]: { ts: 1 },
+                                                        },
+                                                    },
+                                                },
+                                                type: "m.receipt",
+                                            },
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                    } as unknown as ISyncResponse;
+
+                    httpBackend!.when("GET", "/sync").respond(200, syncData2);
+
+                    await Promise.all([httpBackend!.flush("/sync", 1), utils.syncPromise(client!)]);
+
+                    expect(room.getRoomUnreadNotificationCount(NotificationCountType.Highlight)).toBe(0);
+                });
+
+                it("should recalculate highlights on threaded receipt for encrypted rooms", async () => {
+                    const myUserId = client!.getUserId()!;
+
+                    // add a receipt for the first message in the threadm leaving the second one unread
+                    syncData.rooms.join[roomId].ephemeral.events = [
+                        {
+                            content: {
+                                [threadEvent1.event_id]: {
+                                    "m.read": {
+                                        [myUserId]: { ts: 1, thread_id: firstEventId },
+                                    },
+                                },
+                            },
+                            type: "m.receipt",
+                        },
+                    ];
+
+                    // fudge to make both thread replies highlights
+                    client!.getPushActionsForEvent = (ev: MatrixEvent): IActionsObject | null => {
+                        if ([threadEvent1.event_id, threadEvent2.event_id].includes(ev.getId()!)) {
+                            return {
+                                notify: true,
+                                tweaks: {
+                                    highlight: true,
+                                },
+                            };
+                        }
+                        return null;
+                    };
+
+                    httpBackend!.when("GET", "/sync").respond(200, syncData);
+                    client!.startClient({ threadSupport: true });
+
+                    await Promise.all([httpBackend!.flushAllExpected(), awaitSyncEvent()]);
+
+                    const room = client!.getRoom(roomId)!;
+                    expect(room).toBeInstanceOf(Room);
+
+                    // pretend that the client has decrypted an event to trigger it to compute
+                    // local notifications
+                    client?.emit(MatrixEventEvent.Decrypted, room.findEventById(firstEventId)!);
+
+                    // the room should now have one highlight: the second thread message
+
+                    expect(room.getThreadUnreadNotificationCount(firstEventId, NotificationCountType.Highlight)).toBe(
+                        1,
+                    );
+                });
+            });
+        });
     });
 
     describe("of a room", () => {
-        xit(
+        it.skip(
             "should sync when a join event (which changes state) for the user" +
                 " arrives down the event stream (e.g. join from another device)",
             () => {},
         );
 
-        xit("should sync when the user explicitly calls joinRoom", () => {});
+        it.skip("should sync when the user explicitly calls joinRoom", () => {});
     });
 
     describe("syncLeftRooms", () => {
-        beforeEach((done) => {
+        beforeEach(async () => {
             client!.startClient();
 
-            httpBackend!.flushAllExpected().then(() => {
-                // the /sync call from syncLeftRooms ends up in the request
-                // queue behind the call from the running client; add a response
-                // to flush the client's one out.
-                httpBackend!.when("GET", "/sync").respond(200, {});
-
-                done();
-            });
+            await httpBackend!.flushAllExpected();
+            // the /sync call from syncLeftRooms ends up in the request
+            // queue behind the call from the running client; add a response
+            // to flush the client's one out.
+            await httpBackend!.when("GET", "/sync").respond(200, {});
         });
 
         it("should create and use an appropriate filter", () => {
@@ -1699,67 +2281,70 @@ describe("MatrixClient syncing", () => {
             httpBackend!.expectedRequests = [];
         });
 
-        it("should return a room based on the room initialSync API", async () => {
-            httpBackend!.when("GET", `/rooms/${encodeURIComponent(roomOne)}/initialSync`).respond(200, {
-                room_id: roomOne,
-                membership: "leave",
-                messages: {
-                    start: "start",
-                    end: "end",
-                    chunk: [
+        it.each([undefined, 100])(
+            "should return a room based on the room initialSync API with limit %s",
+            async (limit) => {
+                httpBackend!.when("GET", `/rooms/${encodeURIComponent(roomOne)}/initialSync`).respond(200, {
+                    room_id: roomOne,
+                    membership: KnownMembership.Leave,
+                    messages: {
+                        start: "start",
+                        end: "end",
+                        chunk: [
+                            {
+                                content: { body: "Message 1" },
+                                type: "m.room.message",
+                                event_id: "$eventId1",
+                                sender: userA,
+                                origin_server_ts: 12313525,
+                                room_id: roomOne,
+                            },
+                            {
+                                content: { body: "Message 2" },
+                                type: "m.room.message",
+                                event_id: "$eventId2",
+                                sender: userB,
+                                origin_server_ts: 12315625,
+                                room_id: roomOne,
+                            },
+                        ],
+                    },
+                    state: [
                         {
-                            content: { body: "Message 1" },
-                            type: "m.room.message",
-                            event_id: "$eventId1",
+                            content: { name: "Room Name" },
+                            type: "m.room.name",
+                            event_id: "$eventId",
                             sender: userA,
-                            origin_server_ts: 12313525,
-                            room_id: roomOne,
-                        },
-                        {
-                            content: { body: "Message 2" },
-                            type: "m.room.message",
-                            event_id: "$eventId2",
-                            sender: userB,
-                            origin_server_ts: 12315625,
+                            origin_server_ts: 12314525,
+                            state_key: "",
                             room_id: roomOne,
                         },
                     ],
-                },
-                state: [
-                    {
-                        content: { name: "Room Name" },
-                        type: "m.room.name",
-                        event_id: "$eventId",
-                        sender: userA,
-                        origin_server_ts: 12314525,
-                        state_key: "",
-                        room_id: roomOne,
-                    },
-                ],
-                presence: [
-                    {
-                        content: {},
-                        type: "m.presence",
-                        sender: userA,
-                    },
-                ],
-            });
-            httpBackend!.when("GET", "/events").respond(200, { chunk: [] });
+                    presence: [
+                        {
+                            content: {},
+                            type: "m.presence",
+                            sender: userA,
+                        },
+                    ],
+                });
+                httpBackend!.when("GET", "/events").respond(200, { chunk: [] });
 
-            const prom = client!.peekInRoom(roomOne);
-            await httpBackend!.flushAllExpected();
-            const room = await prom;
+                const prom = client!.peekInRoom(roomOne, limit);
+                await httpBackend!.flushAllExpected();
+                const room = await prom;
 
-            expect(room.roomId).toBe(roomOne);
-            expect(room.getMyMembership()).toBe("leave");
-            expect(room.name).toBe("Room Name");
-            expect(room.currentState.getStateEvents("m.room.name", "")?.getId()).toBe("$eventId");
-            expect(room.timeline[0].getContent().body).toBe("Message 1");
-            expect(room.timeline[1].getContent().body).toBe("Message 2");
-            client?.stopPeeking();
-            httpBackend!.when("GET", "/events").respond(200, { chunk: [] });
-            await httpBackend!.flushAllExpected();
-        });
+                expect(room.roomId).toBe(roomOne);
+                expect(room.getMyMembership()).toBe(KnownMembership.Leave);
+                expect(room.name).toBe("Room Name");
+                expect(room.currentState.getStateEvents("m.room.name", "")?.getId()).toBe("$eventId");
+                expect(room.timeline[0].getContent().body).toBe("Message 1");
+                expect(room.timeline[1].getContent().body).toBe("Message 2");
+                client?.stopPeeking();
+                httpBackend!.when("GET", "/events").respond(200, { chunk: [] });
+                await httpBackend!.flushAllExpected();
+            },
+        );
     });
 
     describe("user account data", () => {
@@ -1843,7 +2428,7 @@ describe("MatrixClient syncing (IndexedDB version)", () => {
                                 type: "m.room.member",
                                 state_key: selfUserId,
                                 content: {
-                                    membership: "invite",
+                                    membership: KnownMembership.Invite,
                                 },
                             },
                         ],
@@ -1872,5 +2457,125 @@ describe("MatrixClient syncing (IndexedDB version)", () => {
         idbHttpBackend.verifyNoOutstandingExpectation();
         idbClient.stopClient();
         idbHttpBackend.stop();
+    });
+
+    it("should query server for which thread a 2nd order relation belongs to and stash in sync accumulator", async () => {
+        const roomId = "!room:example.org";
+
+        async function startClient(client: MatrixClient): Promise<void> {
+            await Promise.all([
+                idbClient.startClient({
+                    // Without this all events just go into the main timeline
+                    threadSupport: true,
+                }),
+                idbHttpBackend.flushAllExpected(),
+                emitPromise(idbClient, ClientEvent.Room),
+            ]);
+        }
+
+        function assertEventsExpected(client: MatrixClient): void {
+            const room = client.getRoom(roomId);
+            const mainTimelineEvents = room!.getLiveTimeline().getEvents();
+            expect(mainTimelineEvents).toHaveLength(1);
+            expect(mainTimelineEvents[0].getContent().body).toEqual("Test");
+
+            const thread = room!.getThread("$someThreadId")!;
+            expect(thread.replayEvents).toHaveLength(1);
+            expect(thread.replayEvents![0].getRelation()!.key).toEqual("🪿");
+        }
+
+        let idbTestClient = new TestClient(selfUserId, "DEVICE", selfAccessToken, undefined, {
+            store: new IndexedDBStore({
+                indexedDB: global.indexedDB,
+                dbName: "test",
+            }),
+        });
+        let idbHttpBackend = idbTestClient.httpBackend;
+        let idbClient = idbTestClient.client;
+        await idbClient.store.startup();
+
+        idbHttpBackend.when("GET", "/versions").respond(200, { versions: ["v1.4"] });
+        idbHttpBackend.when("GET", "/pushrules/").respond(200, {});
+        idbHttpBackend.when("POST", "/filter").respond(200, { filter_id: "a filter id" });
+
+        const syncRoomSection = {
+            join: {
+                [roomId]: {
+                    timeline: {
+                        prev_batch: "foo",
+                        events: [
+                            mkMessage({
+                                room: roomId,
+                                user: selfUserId,
+                                msg: "Test",
+                            }),
+                            mkEvent({
+                                room: roomId,
+                                user: selfUserId,
+                                content: {
+                                    "m.relates_to": {
+                                        rel_type: RelationType.Annotation,
+                                        event_id: "$someUnknownEvent",
+                                        key: "🪿",
+                                    },
+                                },
+                                type: "m.reaction",
+                            }),
+                        ],
+                    },
+                },
+            },
+        };
+        idbHttpBackend.when("GET", "/sync").respond(200, {
+            ...syncData,
+            rooms: syncRoomSection,
+        });
+        idbHttpBackend.when("GET", `/rooms/${encodeURIComponent(roomId)}/event/%24someUnknownEvent`).respond(
+            200,
+            mkEvent({
+                room: roomId,
+                user: selfUserId,
+                content: {
+                    "body": "Thread response",
+                    "m.relates_to": {
+                        rel_type: THREAD_RELATION_TYPE.name,
+                        event_id: "$someThreadId",
+                    },
+                },
+                type: "m.room.message",
+            }),
+        );
+
+        await startClient(idbClient);
+        assertEventsExpected(idbClient);
+
+        idbHttpBackend.verifyNoOutstandingExpectation();
+        // Force sync accumulator to persist, reset client, assert it doesn't re-fetch event on next start-up
+        await idbClient.store.save(true);
+        await idbClient.stopClient();
+        await idbClient.store.destroy();
+        await idbHttpBackend.stop();
+
+        idbTestClient = new TestClient(selfUserId, "DEVICE", selfAccessToken, undefined, {
+            store: new IndexedDBStore({
+                indexedDB: global.indexedDB,
+                dbName: "test",
+            }),
+        });
+        idbHttpBackend = idbTestClient.httpBackend;
+        idbClient = idbTestClient.client;
+        await idbClient.store.startup();
+
+        idbHttpBackend.when("GET", "/versions").respond(200, { versions: ["v1.4"] });
+        idbHttpBackend.when("GET", "/pushrules/").respond(200, {});
+        idbHttpBackend.when("POST", "/filter").respond(200, { filter_id: "a filter id" });
+        idbHttpBackend.when("GET", "/sync").respond(200, syncData);
+
+        await startClient(idbClient);
+        assertEventsExpected(idbClient);
+
+        idbHttpBackend.verifyNoOutstandingExpectation();
+        await idbClient.stopClient();
+        await idbHttpBackend.stop();
     });
 });

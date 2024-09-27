@@ -18,12 +18,11 @@ limitations under the License.
  * This is an internal module which manages queuing, scheduling and retrying
  * of requests.
  */
-import * as utils from "./utils";
 import { logger } from "./logger";
 import { MatrixEvent } from "./models/event";
 import { EventType } from "./@types/event";
-import { IDeferred } from "./utils";
-import { ConnectionError, MatrixError } from "./http-api";
+import { defer, IDeferred, removeElement } from "./utils";
+import { calculateRetryBackoff, MatrixError } from "./http-api";
 import { ISendEventResponse } from "./@types/requests";
 
 const DEBUG = false; // set true to enable console logging.
@@ -44,38 +43,13 @@ type ProcessFunction<T> = (event: MatrixEvent) => Promise<T>;
 // eslint-disable-next-line camelcase
 export class MatrixScheduler<T = ISendEventResponse> {
     /**
-     * Retries events up to 4 times using exponential backoff. This produces wait
-     * times of 2, 4, 8, and 16 seconds (30s total) after which we give up. If the
-     * failure was due to a rate limited request, the time specified in the error is
-     * waited before being retried.
+     * Default retry algorithm for the matrix scheduler. Retries events up to 4 times with exponential backoff.
      * @param attempts - Number of attempts that have been made, including the one that just failed (ie. starting at 1)
      * @see retryAlgorithm
      */
     // eslint-disable-next-line @typescript-eslint/naming-convention
     public static RETRY_BACKOFF_RATELIMIT(event: MatrixEvent | null, attempts: number, err: MatrixError): number {
-        if (err.httpStatus === 400 || err.httpStatus === 403 || err.httpStatus === 401) {
-            // client error; no amount of retrying with save you now.
-            return -1;
-        }
-        if (err instanceof ConnectionError) {
-            return -1;
-        }
-
-        // if event that we are trying to send is too large in any way then retrying won't help
-        if (err.name === "M_TOO_LARGE") {
-            return -1;
-        }
-
-        if (err.name === "M_LIMIT_EXCEEDED") {
-            const waitTime = err.data.retry_after_ms;
-            if (waitTime > 0) {
-                return waitTime;
-            }
-        }
-        if (attempts > 4) {
-            return -1; // give up
-        }
-        return 1000 * Math.pow(2, attempts);
+        return calculateRetryBackoff(err, attempts, false);
     }
 
     /**
@@ -175,7 +149,7 @@ export class MatrixScheduler<T = ISendEventResponse> {
             return false;
         }
         let removed = false;
-        utils.removeElement(this.queues[name], (element) => {
+        removeElement(this.queues[name], (element) => {
             if (element.event.getId() === event.getId()) {
                 // XXX we should probably reject the promise?
                 // https://github.com/matrix-org/matrix-js-sdk/issues/496
@@ -214,15 +188,15 @@ export class MatrixScheduler<T = ISendEventResponse> {
         if (!this.queues[queueName]) {
             this.queues[queueName] = [];
         }
-        const defer = utils.defer<T>();
+        const deferred = defer<T>();
         this.queues[queueName].push({
             event: event,
-            defer: defer,
+            defer: deferred,
             attempts: 0,
         });
         debuglog("Queue algorithm dumped event %s into queue '%s'", event.getId(), queueName);
         this.startProcessingQueues();
-        return defer.promise;
+        return deferred.promise;
     }
 
     private startProcessingQueues(): void {
@@ -245,12 +219,7 @@ export class MatrixScheduler<T = ISendEventResponse> {
         // get head of queue
         const obj = this.peekNextEvent(queueName);
         if (!obj) {
-            // queue is empty. Mark as inactive and stop recursing.
-            const index = this.activeQueues.indexOf(queueName);
-            if (index >= 0) {
-                this.activeQueues.splice(index, 1);
-            }
-            debuglog("Stopping queue '%s' as it is now empty", queueName);
+            this.disableQueue(queueName);
             return;
         }
         debuglog("Queue '%s' has %s pending events", queueName, this.queues[queueName].length);
@@ -287,18 +256,33 @@ export class MatrixScheduler<T = ISendEventResponse> {
                     );
                     if (waitTimeMs === -1) {
                         // give up (you quitter!)
-                        debuglog("Queue '%s' giving up on event %s", queueName, obj.event.getId());
+                        logger.info("Queue '%s' giving up on event %s", queueName, obj.event.getId());
                         // remove this from the queue
-                        this.removeNextEvent(queueName);
-                        obj.defer.reject(err);
-                        // process next event
-                        this.processQueue(queueName);
+                        this.clearQueue(queueName, err);
                     } else {
                         setTimeout(this.processQueue, waitTimeMs, queueName);
                     }
                 },
             );
     };
+
+    private disableQueue(queueName: string): void {
+        // queue is empty. Mark as inactive and stop recursing.
+        const index = this.activeQueues.indexOf(queueName);
+        if (index >= 0) {
+            this.activeQueues.splice(index, 1);
+        }
+        logger.info("Stopping queue '%s' as it is now empty", queueName);
+    }
+
+    private clearQueue(queueName: string, err: unknown): void {
+        logger.info("clearing queue '%s'", queueName);
+        let obj: IQueueEntry<T> | undefined;
+        while ((obj = this.removeNextEvent(queueName))) {
+            obj.defer.reject(err);
+        }
+        this.disableQueue(queueName);
+    }
 
     private peekNextEvent(queueName: string): IQueueEntry<T> | undefined {
         const queue = this.queues[queueName];

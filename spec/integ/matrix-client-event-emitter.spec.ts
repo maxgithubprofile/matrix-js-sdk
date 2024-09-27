@@ -28,6 +28,7 @@ import {
 } from "../../src";
 import * as utils from "../test-utils/test-utils";
 import { TestClient } from "../TestClient";
+import { KnownMembership } from "../../src/@types/membership";
 
 describe("MatrixClient events", function () {
     const selfUserId = "@alice:localhost";
@@ -85,16 +86,14 @@ describe("MatrixClient events", function () {
                             events: [
                                 utils.mkMembership({
                                     room: "!erufh:bar",
-                                    mship: "join",
+                                    mship: KnownMembership.Join,
                                     user: "@foo:bar",
                                 }),
                                 utils.mkEvent({
                                     type: "m.room.create",
                                     room: "!erufh:bar",
                                     user: "@foo:bar",
-                                    content: {
-                                        creator: "@foo:bar",
-                                    },
+                                    content: {},
                                 }),
                             ],
                         },
@@ -175,7 +174,7 @@ describe("MatrixClient events", function () {
             });
         });
 
-        it("should emit User events", function (done) {
+        it("should emit User events", async () => {
             httpBackend!.when("GET", "/sync").respond(200, SYNC_DATA);
             httpBackend!.when("GET", "/sync").respond(200, NEXT_SYNC_DATA);
             let fired = false;
@@ -192,10 +191,39 @@ describe("MatrixClient events", function () {
             });
             client!.startClient();
 
-            httpBackend!.flushAllExpected().then(function () {
-                expect(fired).toBe(true);
-                done();
+            await httpBackend!.flushAllExpected();
+            expect(fired).toBe(true);
+        });
+
+        it("should emit User events when presence data is absent in first sync", async () => {
+            const MODIFIED_SYNC_DATA: any = structuredClone(SYNC_DATA);
+            delete MODIFIED_SYNC_DATA["presence"];
+            const MODIFIED_NEXT_SYNC_DATA: any = structuredClone(NEXT_SYNC_DATA);
+            MODIFIED_NEXT_SYNC_DATA.presence = {
+                events: [
+                    utils.mkPresence({
+                        user: "@foo:bar",
+                        name: "Foo Bar",
+                        presence: "online",
+                    }),
+                ],
+            };
+            httpBackend!.when("GET", "/sync").respond(200, MODIFIED_SYNC_DATA);
+            httpBackend!.when("GET", "/sync").respond(200, MODIFIED_NEXT_SYNC_DATA);
+            let fired = false;
+            client!.on(UserEvent.Presence, function (event, user) {
+                fired = true;
+                expect(user).toBeTruthy();
+                expect(event).toBeTruthy();
+                if (!user || !event) {
+                    return;
+                }
+                expect(event.event).toEqual(MODIFIED_NEXT_SYNC_DATA.presence.events[0]);
+                expect(user.presence).toEqual(MODIFIED_NEXT_SYNC_DATA.presence.events[0]?.content?.presence);
             });
+            client!.startClient();
+            await httpBackend!.flushAllExpected();
+            expect(fired).toBe(true);
         });
 
         it("should emit Room events", function () {
@@ -245,7 +273,7 @@ describe("MatrixClient events", function () {
                 membersInvokeCount++;
                 expect(member.roomId).toEqual("!erufh:bar");
                 expect(member.userId).toEqual("@foo:bar");
-                expect(member.membership).toEqual("join");
+                expect(member.membership).toEqual(KnownMembership.Join);
             });
             client!.on(RoomStateEvent.NewMember, function (event, state, member) {
                 newMemberInvokeCount++;
@@ -283,7 +311,7 @@ describe("MatrixClient events", function () {
             });
             client!.on(RoomMemberEvent.Membership, function (event, member) {
                 membershipInvokeCount++;
-                expect(member.membership).toEqual("join");
+                expect(member.membership).toEqual(KnownMembership.Join);
             });
 
             client!.startClient();

@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Matrix.org Foundation C.I.C.
+Copyright 2022 - 2023 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,21 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import { mocked } from "jest-mock";
+import { Mocked, mocked } from "jest-mock";
 
 import { logger } from "../../src/logger";
-import { ClientEvent, ITurnServerResponse, MatrixClient, Store } from "../../src/client";
+import { ClientEvent, IMatrixClientCreateOpts, ITurnServerResponse, MatrixClient, Store } from "../../src/client";
 import { Filter } from "../../src/filter";
 import { DEFAULT_TREE_POWER_LEVELS_TEMPLATE } from "../../src/models/MSC3089TreeSpace";
 import {
     EventType,
+    MsgType,
     RelationType,
     RoomCreateTypeField,
     RoomType,
     UNSTABLE_MSC3088_ENABLED,
     UNSTABLE_MSC3088_PURPOSE,
     UNSTABLE_MSC3089_TREE_SUBTYPE,
-    MSC3912_RELATION_BASED_REDACTIONS_PROP,
 } from "../../src/@types/event";
 import { MEGOLM_ALGORITHM } from "../../src/crypto/olmlib";
 import { Crypto } from "../../src/crypto";
@@ -39,30 +39,43 @@ import * as testUtils from "../test-utils/test-utils";
 import { makeBeaconInfoContent } from "../../src/content-helpers";
 import { M_BEACON_INFO } from "../../src/@types/beacon";
 import {
-    ContentHelpers,
     ClientPrefix,
+    ConditionKind,
+    ContentHelpers,
     Direction,
     EventTimeline,
+    EventTimelineSet,
+    getHttpUriForMxc,
     ICreateRoomOpts,
+    IPushRule,
     IRequestOpts,
     MatrixError,
     MatrixHttpApi,
     MatrixScheduler,
     Method,
+    PushRuleActionName,
     Room,
+    RuleId,
+    TweakName,
+    UpdateDelayedEventAction,
 } from "../../src";
 import { supportsMatrixCall } from "../../src/webrtc/call";
 import { makeBeaconEvent } from "../test-utils/beacon";
 import {
     IGNORE_INVITES_ACCOUNT_EVENT_KEY,
     POLICIES_ACCOUNT_EVENT_TYPE,
+    PolicyRecommendation,
     PolicyScope,
 } from "../../src/models/invites-ignorer";
 import { IOlmDevice } from "../../src/crypto/algorithms/megolm";
-import { QueryDict } from "../../src/utils";
+import { defer, QueryDict } from "../../src/utils";
 import { SyncState } from "../../src/sync";
 import * as featureUtils from "../../src/feature";
 import { StubStore } from "../../src/store/stub";
+import { SecretStorageKeyDescriptionAesV1, ServerSideSecretStorageImpl } from "../../src/secret-storage";
+import { CryptoBackend } from "../../src/common-crypto/CryptoBackend";
+import { KnownMembership } from "../../src/@types/membership";
+import { RoomMessageEventContent } from "../../src/@types/events";
 
 jest.useFakeTimers();
 
@@ -85,7 +98,7 @@ type HttpLookup = {
     method: string;
     path: string;
     prefix?: string;
-    data?: Record<string, any>;
+    data?: Record<string, any> | Record<string, any>[];
     error?: object;
     expectBody?: Record<string, any>;
     expectQueryParams?: QueryDict;
@@ -173,9 +186,7 @@ describe("MatrixClient", function () {
         data: SYNC_DATA,
     };
 
-    const unstableFeatures: Record<string, boolean> = {
-        "org.matrix.msc3440.stable": true,
-    };
+    let unstableFeatures: Record<string, boolean> = {};
 
     // items are popped off when processed and block if no items left.
     let httpLookups: HttpLookup[] = [];
@@ -196,7 +207,7 @@ describe("MatrixClient", function () {
         if (path === KEEP_ALIVE_PATH && acceptKeepalives) {
             return Promise.resolve({
                 unstable_features: unstableFeatures,
-                versions: ["r0.6.0", "r0.6.1"],
+                versions: ["v1.1"],
             });
         }
         const next = httpLookups.shift();
@@ -276,7 +287,7 @@ describe("MatrixClient", function () {
         );
     }
 
-    function makeClient() {
+    function makeClient(opts?: Partial<IMatrixClientCreateOpts>) {
         client = new MatrixClient({
             baseUrl: "https://my.home.server",
             idBaseUrl: identityServerUrl,
@@ -285,9 +296,12 @@ describe("MatrixClient", function () {
             store: store,
             scheduler: scheduler,
             userId: userId,
+            ...(opts || {}),
         });
         // FIXME: We shouldn't be yanking http like this.
-        client.http = (["authedRequest", "getContentUri", "request", "uploadContent"] as const).reduce((r, k) => {
+        client.http = (
+            ["authedRequest", "getContentUri", "request", "uploadContent", "idServerRequest"] as const
+        ).reduce((r, k) => {
             r[k] = jest.fn();
             return r;
         }, {} as MatrixHttpApi<any>);
@@ -322,6 +336,7 @@ describe("MatrixClient", function () {
                 "storeFilter",
                 "startup",
                 "deleteAllData",
+                "setUserCreator",
             ] as const
         ).reduce((r, k) => {
             r[k] = jest.fn();
@@ -333,6 +348,12 @@ describe("MatrixClient", function () {
         store.getClientOptions = jest.fn().mockReturnValue(Promise.resolve(null));
         store.storeClientOptions = jest.fn().mockReturnValue(Promise.resolve(null));
         store.isNewlyCreated = jest.fn().mockReturnValue(Promise.resolve(true));
+
+        // set unstableFeatures to a defined state before each test
+        unstableFeatures = {
+            "org.matrix.msc3440.stable": true,
+        };
+
         makeClient();
 
         // set reasonable working defaults
@@ -354,6 +375,24 @@ describe("MatrixClient", function () {
             return new Promise(() => {});
         });
         client.stopClient();
+    });
+
+    describe("mxcUrlToHttp", () => {
+        it("should call getHttpUriForMxc", () => {
+            const mxc = "mxc://server/example";
+            expect(client.mxcUrlToHttp(mxc)).toBe(getHttpUriForMxc(client.baseUrl, mxc));
+            expect(client.mxcUrlToHttp(mxc, 32)).toBe(getHttpUriForMxc(client.baseUrl, mxc, 32));
+            expect(client.mxcUrlToHttp(mxc, 32, 46)).toBe(getHttpUriForMxc(client.baseUrl, mxc, 32, 46));
+            expect(client.mxcUrlToHttp(mxc, 32, 46, "scale")).toBe(
+                getHttpUriForMxc(client.baseUrl, mxc, 32, 46, "scale"),
+            );
+            expect(client.mxcUrlToHttp(mxc, 32, 46, "scale", false, true)).toBe(
+                getHttpUriForMxc(client.baseUrl, mxc, 32, 46, "scale", false, true),
+            );
+            expect(client.mxcUrlToHttp(mxc, 32, 46, "scale", false, true, true)).toBe(
+                getHttpUriForMxc(client.baseUrl, mxc, 32, 46, "scale", false, true, true),
+            );
+        });
     });
 
     describe("timestampToEvent", () => {
@@ -536,7 +575,7 @@ describe("MatrixClient", function () {
     describe("sendEvent", () => {
         const roomId = "!room:example.org";
         const body = "This is the body";
-        const content = { body };
+        const content = { body, msgtype: MsgType.Text } satisfies RoomMessageEventContent;
 
         it("overload without threadId works", async () => {
             const eventId = "$eventId:example.org";
@@ -631,12 +670,13 @@ describe("MatrixClient", function () {
 
             const content = {
                 body,
+                "msgtype": MsgType.Text,
                 "m.relates_to": {
                     "m.in_reply_to": {
                         event_id: "$other:event",
                     },
                 },
-            };
+            } satisfies RoomMessageEventContent;
 
             const room = new Room(roomId, client, userId);
             mocked(store.getRoom).mockReturnValue(room);
@@ -664,6 +704,328 @@ describe("MatrixClient", function () {
             ];
 
             await client.sendEvent(roomId, threadId, EventType.RoomMessage, { ...content }, txnId);
+        });
+    });
+
+    describe("_unstable_sendDelayedEvent", () => {
+        const unstableMSC4140Prefix = `${ClientPrefix.Unstable}/org.matrix.msc4140`;
+
+        const roomId = "!room:example.org";
+        const body = "This is the body";
+        const content = { body, msgtype: MsgType.Text } satisfies RoomMessageEventContent;
+        const timeoutDelayOpts = { delay: 2000 };
+        const realTimeoutDelayOpts = { "org.matrix.msc4140.delay": 2000 };
+
+        beforeEach(() => {
+            unstableFeatures["org.matrix.msc4140"] = true;
+        });
+
+        it("throws when unsupported by server", async () => {
+            unstableFeatures["org.matrix.msc4140"] = false;
+            const errorMessage = "Server does not support";
+
+            await expect(
+                client._unstable_sendDelayedEvent(
+                    roomId,
+                    timeoutDelayOpts,
+                    null,
+                    EventType.RoomMessage,
+                    { ...content },
+                    client.makeTxnId(),
+                ),
+            ).rejects.toThrow(errorMessage);
+
+            await expect(
+                client._unstable_sendDelayedStateEvent(roomId, timeoutDelayOpts, EventType.RoomTopic, {
+                    topic: "topic",
+                }),
+            ).rejects.toThrow(errorMessage);
+
+            await expect(client._unstable_getDelayedEvents()).rejects.toThrow(errorMessage);
+
+            await expect(
+                client._unstable_updateDelayedEvent("anyDelayId", UpdateDelayedEventAction.Send),
+            ).rejects.toThrow(errorMessage);
+        });
+
+        it("works with null threadId", async () => {
+            httpLookups = [];
+
+            const timeoutDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${timeoutDelayTxnId}`,
+                expectQueryParams: realTimeoutDelayOpts,
+                data: { delay_id: "id1" },
+                expectBody: content,
+            });
+
+            const { delay_id: timeoutDelayId } = await client._unstable_sendDelayedEvent(
+                roomId,
+                timeoutDelayOpts,
+                null,
+                EventType.RoomMessage,
+                { ...content },
+                timeoutDelayTxnId,
+            );
+
+            const actionDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${actionDelayTxnId}`,
+                expectQueryParams: { "org.matrix.msc4140.parent_delay_id": timeoutDelayId },
+                data: { delay_id: "id2" },
+                expectBody: content,
+            });
+
+            await client._unstable_sendDelayedEvent(
+                roomId,
+                { parent_delay_id: timeoutDelayId },
+                null,
+                EventType.RoomMessage,
+                { ...content },
+                actionDelayTxnId,
+            );
+        });
+
+        it("works with non-null threadId", async () => {
+            httpLookups = [];
+            const threadId = "$threadId:server";
+            const expectBody = {
+                ...content,
+                "m.relates_to": {
+                    event_id: threadId,
+                    is_falling_back: true,
+                    rel_type: "m.thread",
+                },
+            };
+
+            const timeoutDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${timeoutDelayTxnId}`,
+                expectQueryParams: realTimeoutDelayOpts,
+                data: { delay_id: "id1" },
+                expectBody,
+            });
+
+            const { delay_id: timeoutDelayId } = await client._unstable_sendDelayedEvent(
+                roomId,
+                timeoutDelayOpts,
+                threadId,
+                EventType.RoomMessage,
+                { ...content },
+                timeoutDelayTxnId,
+            );
+
+            const actionDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${actionDelayTxnId}`,
+                expectQueryParams: { "org.matrix.msc4140.parent_delay_id": timeoutDelayId },
+                data: { delay_id: "id2" },
+                expectBody,
+            });
+
+            await client._unstable_sendDelayedEvent(
+                roomId,
+                { parent_delay_id: timeoutDelayId },
+                threadId,
+                EventType.RoomMessage,
+                { ...content },
+                actionDelayTxnId,
+            );
+        });
+
+        it("should add thread relation if threadId is passed and the relation is missing", async () => {
+            httpLookups = [];
+            const threadId = "$threadId:server";
+            const expectBody = {
+                ...content,
+                "m.relates_to": {
+                    "m.in_reply_to": {
+                        event_id: threadId,
+                    },
+                    "event_id": threadId,
+                    "is_falling_back": true,
+                    "rel_type": "m.thread",
+                },
+            };
+
+            const room = new Room(roomId, client, userId);
+            mocked(store.getRoom).mockReturnValue(room);
+
+            const rootEvent = new MatrixEvent({ event_id: threadId });
+            room.createThread(threadId, rootEvent, [rootEvent], false);
+
+            const timeoutDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${timeoutDelayTxnId}`,
+                expectQueryParams: realTimeoutDelayOpts,
+                data: { delay_id: "id1" },
+                expectBody,
+            });
+
+            const { delay_id: timeoutDelayId } = await client._unstable_sendDelayedEvent(
+                roomId,
+                timeoutDelayOpts,
+                threadId,
+                EventType.RoomMessage,
+                { ...content },
+                timeoutDelayTxnId,
+            );
+
+            const actionDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${actionDelayTxnId}`,
+                expectQueryParams: { "org.matrix.msc4140.parent_delay_id": timeoutDelayId },
+                data: { delay_id: "id2" },
+                expectBody,
+            });
+
+            await client._unstable_sendDelayedEvent(
+                roomId,
+                { parent_delay_id: timeoutDelayId },
+                threadId,
+                EventType.RoomMessage,
+                { ...content },
+                actionDelayTxnId,
+            );
+        });
+
+        it("should add thread relation if threadId is passed and the relation is missing with reply", async () => {
+            httpLookups = [];
+            const threadId = "$threadId:server";
+
+            const content = {
+                body,
+                "msgtype": MsgType.Text,
+                "m.relates_to": {
+                    "m.in_reply_to": {
+                        event_id: "$other:event",
+                    },
+                },
+            } satisfies RoomMessageEventContent;
+            const expectBody = {
+                ...content,
+                "m.relates_to": {
+                    "m.in_reply_to": {
+                        event_id: "$other:event",
+                    },
+                    "event_id": threadId,
+                    "is_falling_back": false,
+                    "rel_type": "m.thread",
+                },
+            };
+
+            const room = new Room(roomId, client, userId);
+            mocked(store.getRoom).mockReturnValue(room);
+
+            const rootEvent = new MatrixEvent({ event_id: threadId });
+            room.createThread(threadId, rootEvent, [rootEvent], false);
+
+            const timeoutDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${timeoutDelayTxnId}`,
+                expectQueryParams: realTimeoutDelayOpts,
+                data: { delay_id: "id1" },
+                expectBody,
+            });
+
+            const { delay_id: timeoutDelayId } = await client._unstable_sendDelayedEvent(
+                roomId,
+                timeoutDelayOpts,
+                threadId,
+                EventType.RoomMessage,
+                { ...content },
+                timeoutDelayTxnId,
+            );
+
+            const actionDelayTxnId = client.makeTxnId();
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${actionDelayTxnId}`,
+                expectQueryParams: { "org.matrix.msc4140.parent_delay_id": timeoutDelayId },
+                data: { delay_id: "id2" },
+                expectBody,
+            });
+
+            await client._unstable_sendDelayedEvent(
+                roomId,
+                { parent_delay_id: timeoutDelayId },
+                threadId,
+                EventType.RoomMessage,
+                { ...content },
+                actionDelayTxnId,
+            );
+        });
+
+        it("can send a delayed state event", async () => {
+            httpLookups = [];
+            const content = { topic: "The year 2000" };
+
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/state/m.room.topic/`,
+                expectQueryParams: realTimeoutDelayOpts,
+                data: { delay_id: "id1" },
+                expectBody: content,
+            });
+
+            const { delay_id: timeoutDelayId } = await client._unstable_sendDelayedStateEvent(
+                roomId,
+                timeoutDelayOpts,
+                EventType.RoomTopic,
+                { ...content },
+            );
+
+            httpLookups.push({
+                method: "PUT",
+                path: `/rooms/${encodeURIComponent(roomId)}/state/m.room.topic/`,
+                expectQueryParams: { "org.matrix.msc4140.parent_delay_id": timeoutDelayId },
+                data: { delay_id: "id2" },
+                expectBody: content,
+            });
+
+            await client._unstable_sendDelayedStateEvent(
+                roomId,
+                { parent_delay_id: timeoutDelayId },
+                EventType.RoomTopic,
+                { ...content },
+            );
+        });
+
+        it("can look up delayed events", async () => {
+            httpLookups = [
+                {
+                    method: "GET",
+                    prefix: unstableMSC4140Prefix,
+                    path: "/delayed_events",
+                    data: [],
+                },
+            ];
+
+            await client._unstable_getDelayedEvents();
+        });
+
+        it("can update delayed events", async () => {
+            const delayId = "id";
+            const action = UpdateDelayedEventAction.Restart;
+            httpLookups = [
+                {
+                    method: "POST",
+                    prefix: unstableMSC4140Prefix,
+                    path: `/delayed_events/${encodeURIComponent(delayId)}`,
+                    data: {
+                        action,
+                    },
+                },
+            ];
+
+            await client._unstable_updateDelayedEvent(delayId, action);
         });
     });
 
@@ -721,9 +1083,10 @@ describe("MatrixClient", function () {
     it("should get (unstable) file trees with valid state", async () => {
         const roomId = "!room:example.org";
         const mockRoom = {
-            getMyMembership: () => "join",
+            getMyMembership: () => KnownMembership.Join,
             currentState: {
                 getStateEvents: (eventType, stateKey) => {
+                    /* eslint-disable jest/no-conditional-expect */
                     if (eventType === EventType.RoomCreate) {
                         expect(stateKey).toEqual("");
                         return new MatrixEvent({
@@ -742,6 +1105,7 @@ describe("MatrixClient", function () {
                     } else {
                         throw new Error("Unexpected event type or state key");
                     }
+                    /* eslint-enable jest/no-conditional-expect */
                 },
             } as Room["currentState"],
         } as unknown as Room;
@@ -758,7 +1122,7 @@ describe("MatrixClient", function () {
     it("should not get (unstable) file trees if not joined", async () => {
         const roomId = "!room:example.org";
         const mockRoom = {
-            getMyMembership: () => "leave", // "not join"
+            getMyMembership: () => KnownMembership.Leave, // "not join"
         } as unknown as Room;
         client.getRoom = (getRoomId) => {
             expect(getRoomId).toEqual(roomId);
@@ -781,9 +1145,10 @@ describe("MatrixClient", function () {
     it("should not get (unstable) file trees with invalid create contents", async () => {
         const roomId = "!room:example.org";
         const mockRoom = {
-            getMyMembership: () => "join",
+            getMyMembership: () => KnownMembership.Join,
             currentState: {
                 getStateEvents: (eventType, stateKey) => {
+                    /* eslint-disable jest/no-conditional-expect */
                     if (eventType === EventType.RoomCreate) {
                         expect(stateKey).toEqual("");
                         return new MatrixEvent({
@@ -802,6 +1167,7 @@ describe("MatrixClient", function () {
                     } else {
                         throw new Error("Unexpected event type or state key");
                     }
+                    /* eslint-enable jest/no-conditional-expect */
                 },
             } as Room["currentState"],
         } as unknown as Room;
@@ -816,9 +1182,10 @@ describe("MatrixClient", function () {
     it("should not get (unstable) file trees with invalid purpose/subtype contents", async () => {
         const roomId = "!room:example.org";
         const mockRoom = {
-            getMyMembership: () => "join",
+            getMyMembership: () => KnownMembership.Join,
             currentState: {
                 getStateEvents: (eventType, stateKey) => {
+                    /* eslint-disable jest/no-conditional-expect */
                     if (eventType === EventType.RoomCreate) {
                         expect(stateKey).toEqual("");
                         return new MatrixEvent({
@@ -836,6 +1203,7 @@ describe("MatrixClient", function () {
                     } else {
                         throw new Error("Unexpected event type or state key");
                     }
+                    /* eslint-enable jest/no-conditional-expect */
                 },
             } as Room["currentState"],
         } as unknown as Room;
@@ -857,6 +1225,7 @@ describe("MatrixClient", function () {
         const syncPromise = new Promise<void>((resolve, reject) => {
             client.on(ClientEvent.Sync, function syncListener(state) {
                 if (state === "SYNCING") {
+                    // eslint-disable-next-line jest/no-conditional-expect
                     expect(httpLookups.length).toEqual(0);
                     client.removeListener(ClientEvent.Sync, syncListener);
                     resolve();
@@ -892,7 +1261,7 @@ describe("MatrixClient", function () {
     describe("getOrCreateFilter", function () {
         it("should POST createFilter if no id is present in localStorage", function () {});
         it("should use an existing filter if id is present in localStorage", function () {});
-        it("should handle localStorage filterId missing from the server", function (done) {
+        it("should handle localStorage filterId missing from the server", async () => {
             function getFilterName(userId: string, suffix?: string) {
                 // scope this on the user ID because people may login on many accounts
                 // and they all need to be stored!
@@ -918,10 +1287,8 @@ describe("MatrixClient", function () {
             client.store.setFilterIdByName(filterName, invalidFilterId);
             const filter = new Filter(client.credentials.userId);
 
-            client.getOrCreateFilter(filterName, filter).then(function (filterId) {
-                expect(filterId).toEqual(FILTER_RESPONSE.data?.filter_id);
-                done();
-            });
+            const filterId = await client.getOrCreateFilter(filterName, filter);
+            expect(filterId).toEqual(!Array.isArray(FILTER_RESPONSE.data) && FILTER_RESPONSE.data?.filter_id);
         });
     });
 
@@ -932,7 +1299,7 @@ describe("MatrixClient", function () {
             expect(client.retryImmediately()).toBe(false);
         });
 
-        it("should work on /filter", function (done) {
+        it("should work on /filter", async () => {
             httpLookups = [];
             httpLookups.push(PUSH_RULES_RESPONSE);
             httpLookups.push({
@@ -943,23 +1310,28 @@ describe("MatrixClient", function () {
             httpLookups.push(FILTER_RESPONSE);
             httpLookups.push(SYNC_RESPONSE);
 
-            client.on(ClientEvent.Sync, function syncListener(state) {
-                if (state === "ERROR" && httpLookups.length > 0) {
-                    expect(httpLookups.length).toEqual(2);
-                    expect(client.retryImmediately()).toBe(true);
-                    jest.advanceTimersByTime(1);
-                } else if (state === "PREPARED" && httpLookups.length === 0) {
-                    client.removeListener(ClientEvent.Sync, syncListener);
-                    done();
-                } else {
-                    // unexpected state transition!
-                    expect(state).toEqual(null);
-                }
+            const wasPreparedPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, function syncListener(state) {
+                    /* eslint-disable jest/no-conditional-expect */
+                    if (state === "ERROR" && httpLookups.length > 0) {
+                        expect(httpLookups.length).toEqual(2);
+                        expect(client.retryImmediately()).toBe(true);
+                        jest.advanceTimersByTime(1);
+                    } else if (state === "PREPARED" && httpLookups.length === 0) {
+                        client.removeListener(ClientEvent.Sync, syncListener);
+                        resolve(null);
+                    } else {
+                        // unexpected state transition!
+                        expect(state).toEqual(null);
+                    }
+                    /* eslint-enable jest/no-conditional-expect */
+                });
             });
-            client.startClient();
+            await client.startClient();
+            await wasPreparedPromise;
         });
 
-        it("should work on /sync", function (done) {
+        it("should work on /sync", async () => {
             httpLookups.push({
                 method: "GET",
                 path: "/sync",
@@ -971,22 +1343,27 @@ describe("MatrixClient", function () {
                 data: SYNC_DATA,
             });
 
-            client.on(ClientEvent.Sync, function syncListener(state) {
-                if (state === "ERROR" && httpLookups.length > 0) {
-                    expect(httpLookups.length).toEqual(1);
-                    expect(client.retryImmediately()).toBe(true);
-                    jest.advanceTimersByTime(1);
-                } else if (state === "RECONNECTING" && httpLookups.length > 0) {
-                    jest.advanceTimersByTime(10000);
-                } else if (state === "SYNCING" && httpLookups.length === 0) {
-                    client.removeListener(ClientEvent.Sync, syncListener);
-                    done();
-                }
+            const isSyncingPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, function syncListener(state) {
+                    if (state === "ERROR" && httpLookups.length > 0) {
+                        /* eslint-disable jest/no-conditional-expect */
+                        expect(httpLookups.length).toEqual(1);
+                        expect(client.retryImmediately()).toBe(true);
+                        /* eslint-enable jest/no-conditional-expect */
+                        jest.advanceTimersByTime(1);
+                    } else if (state === "RECONNECTING" && httpLookups.length > 0) {
+                        jest.advanceTimersByTime(10000);
+                    } else if (state === "SYNCING" && httpLookups.length === 0) {
+                        client.removeListener(ClientEvent.Sync, syncListener);
+                        resolve(null);
+                    }
+                });
             });
-            client.startClient();
+            await client.startClient();
+            await isSyncingPromise;
         });
 
-        it("should work on /pushrules", function (done) {
+        it("should work on /pushrules", async () => {
             httpLookups = [];
             httpLookups.push({
                 method: "GET",
@@ -997,20 +1374,25 @@ describe("MatrixClient", function () {
             httpLookups.push(FILTER_RESPONSE);
             httpLookups.push(SYNC_RESPONSE);
 
-            client.on(ClientEvent.Sync, function syncListener(state) {
-                if (state === "ERROR" && httpLookups.length > 0) {
-                    expect(httpLookups.length).toEqual(3);
-                    expect(client.retryImmediately()).toBe(true);
-                    jest.advanceTimersByTime(1);
-                } else if (state === "PREPARED" && httpLookups.length === 0) {
-                    client.removeListener(ClientEvent.Sync, syncListener);
-                    done();
-                } else {
-                    // unexpected state transition!
-                    expect(state).toEqual(null);
-                }
+            const wasPreparedPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, function syncListener(state) {
+                    /* eslint-disable jest/no-conditional-expect */
+                    if (state === "ERROR" && httpLookups.length > 0) {
+                        expect(httpLookups.length).toEqual(3);
+                        expect(client.retryImmediately()).toBe(true);
+                        jest.advanceTimersByTime(1);
+                    } else if (state === "PREPARED" && httpLookups.length === 0) {
+                        client.removeListener(ClientEvent.Sync, syncListener);
+                        resolve(null);
+                    } else {
+                        // unexpected state transition!
+                        expect(state).toEqual(null);
+                    }
+                    /* eslint-enable jest/no-conditional-expect */
+                });
             });
-            client.startClient();
+            await client.startClient();
+            await wasPreparedPromise;
         });
     });
 
@@ -1034,14 +1416,17 @@ describe("MatrixClient", function () {
             };
         }
 
-        it("should transition null -> PREPARED after the first /sync", function (done) {
+        it("should transition null -> PREPARED after the first /sync", async () => {
             const expectedStates: [string, string | null][] = [];
             expectedStates.push(["PREPARED", null]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
-        it("should transition null -> ERROR after a failed /filter", function (done) {
+        it("should transition null -> ERROR after a failed /filter", async () => {
             const expectedStates: [string, string | null][] = [];
             httpLookups = [];
             httpLookups.push(PUSH_RULES_RESPONSE);
@@ -1051,14 +1436,17 @@ describe("MatrixClient", function () {
                 error: { errcode: "NOPE_NOPE_NOPE" },
             });
             expectedStates.push(["ERROR", null]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
         // Disabled because now `startClient` makes a legit call to `/versions`
         // And those tests are really unhappy about it... Not possible to figure
         // out what a good resolution would look like
-        xit("should transition ERROR -> CATCHUP after /sync if prev failed", function (done) {
+        it.skip("should transition ERROR -> CATCHUP after /sync if prev failed", async () => {
             const expectedStates: [string, string | null][] = [];
             acceptKeepalives = false;
             httpLookups = [];
@@ -1088,19 +1476,25 @@ describe("MatrixClient", function () {
             expectedStates.push(["RECONNECTING", null]);
             expectedStates.push(["ERROR", "RECONNECTING"]);
             expectedStates.push(["CATCHUP", "ERROR"]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
-        it("should transition PREPARED -> SYNCING after /sync", function (done) {
+        it("should transition PREPARED -> SYNCING after /sync", async () => {
             const expectedStates: [string, string | null][] = [];
             expectedStates.push(["PREPARED", null]);
             expectedStates.push(["SYNCING", "PREPARED"]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
-        xit("should transition SYNCING -> ERROR after a failed /sync", function (done) {
+        it.skip("should transition SYNCING -> ERROR after a failed /sync", async () => {
             acceptKeepalives = false;
             const expectedStates: [string, string | null][] = [];
             httpLookups.push({
@@ -1118,11 +1512,14 @@ describe("MatrixClient", function () {
             expectedStates.push(["SYNCING", "PREPARED"]);
             expectedStates.push(["RECONNECTING", "SYNCING"]);
             expectedStates.push(["ERROR", "RECONNECTING"]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
-        xit("should transition ERROR -> SYNCING after /sync if prev failed", function (done) {
+        it.skip("should transition ERROR -> SYNCING after /sync if prev failed", async () => {
             const expectedStates: [string, string | null][] = [];
             httpLookups.push({
                 method: "GET",
@@ -1134,11 +1531,14 @@ describe("MatrixClient", function () {
             expectedStates.push(["PREPARED", null]);
             expectedStates.push(["SYNCING", "PREPARED"]);
             expectedStates.push(["ERROR", "SYNCING"]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
-        it("should transition SYNCING -> SYNCING on subsequent /sync successes", function (done) {
+        it("should transition SYNCING -> SYNCING on subsequent /sync successes", async () => {
             const expectedStates: [string, string | null][] = [];
             httpLookups.push(SYNC_RESPONSE);
             httpLookups.push(SYNC_RESPONSE);
@@ -1146,11 +1546,14 @@ describe("MatrixClient", function () {
             expectedStates.push(["PREPARED", null]);
             expectedStates.push(["SYNCING", "PREPARED"]);
             expectedStates.push(["SYNCING", "SYNCING"]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
 
-        xit("should transition ERROR -> ERROR if keepalive keeps failing", function (done) {
+        it.skip("should transition ERROR -> ERROR if keepalive keeps failing", async () => {
             acceptKeepalives = false;
             const expectedStates: [string, string | null][] = [];
             httpLookups.push({
@@ -1174,8 +1577,11 @@ describe("MatrixClient", function () {
             expectedStates.push(["RECONNECTING", "SYNCING"]);
             expectedStates.push(["ERROR", "RECONNECTING"]);
             expectedStates.push(["ERROR", "ERROR"]);
-            client.on(ClientEvent.Sync, syncChecker(expectedStates, done));
-            client.startClient();
+            const didSyncPromise = new Promise((resolve) => {
+                client.on(ClientEvent.Sync, syncChecker(expectedStates, resolve));
+            });
+            await client.startClient();
+            await didSyncPromise;
         });
     });
 
@@ -1213,7 +1619,7 @@ describe("MatrixClient", function () {
             expect(httpLookups.length).toBe(0);
         });
 
-        xit("should be able to peek into a room using peekInRoom", function (done) {});
+        it.skip("should be able to peek into a room using peekInRoom", function () {});
     });
 
     describe("getPresence", function () {
@@ -1236,7 +1642,7 @@ describe("MatrixClient", function () {
     describe("redactEvent", () => {
         const roomId = "!room:example.org";
         const mockRoom = {
-            getMyMembership: () => "join",
+            getMyMembership: () => KnownMembership.Join,
             currentState: {
                 getStateEvents: (eventType, stateKey) => {
                     if (eventType === EventType.RoomEncryption) {
@@ -1320,10 +1726,10 @@ describe("MatrixClient", function () {
             await client.redactEvent(roomId, eventId, txnId, { reason });
         });
 
-        describe("when calling with with_relations", () => {
+        describe("when calling with 'with_rel_types'", () => {
             const eventId = "$event42:example.org";
 
-            it("should raise an error if server has no support for relation based redactions", async () => {
+            it("should raise an error if the server has no support for relation based redactions", async () => {
                 // load supported features
                 await client.getVersions();
 
@@ -1331,9 +1737,9 @@ describe("MatrixClient", function () {
 
                 expect(() => {
                     client.redactEvent(roomId, eventId, txnId, {
-                        with_relations: [RelationType.Reference],
+                        with_rel_types: [RelationType.Reference],
                     });
-                }).toThrowError(
+                }).toThrow(
                     new Error(
                         "Server does not support relation based redactions " +
                             `roomId ${roomId} eventId ${eventId} txnId: ${txnId} threadId null`,
@@ -1341,34 +1747,30 @@ describe("MatrixClient", function () {
                 );
             });
 
-            describe("and the server supports relation based redactions (unstable)", () => {
-                beforeEach(async () => {
-                    unstableFeatures["org.matrix.msc3912"] = true;
-                    // load supported features
-                    await client.getVersions();
-                });
+            it("and the server has unstable support for relation based redactions, it should send 'org.matrix.msc3912.with_relations' in the request body", async () => {
+                unstableFeatures["org.matrix.msc3912"] = true;
+                // load supported features
+                await client.getVersions();
 
-                it("should send with_relations in the request body", async () => {
-                    const txnId = client.makeTxnId();
+                const txnId = client.makeTxnId();
 
-                    httpLookups = [
-                        {
-                            method: "PUT",
-                            path:
-                                `/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}` +
-                                `/${encodeURIComponent(txnId)}`,
-                            expectBody: {
-                                reason: "redaction test",
-                                [MSC3912_RELATION_BASED_REDACTIONS_PROP.unstable!]: [RelationType.Reference],
-                            },
-                            data: { event_id: eventId },
+                httpLookups = [
+                    {
+                        method: "PUT",
+                        path:
+                            `/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}` +
+                            `/${encodeURIComponent(txnId)}`,
+                        expectBody: {
+                            reason: "redaction test",
+                            ["org.matrix.msc3912.with_relations"]: ["m.reference"],
                         },
-                    ];
+                        data: { event_id: eventId },
+                    },
+                ];
 
-                    await client.redactEvent(roomId, eventId, txnId, {
-                        reason: "redaction test",
-                        with_relations: [RelationType.Reference],
-                    });
+                await client.redactEvent(roomId, eventId, txnId, {
+                    reason: "redaction test",
+                    with_rel_types: [RelationType.Reference],
                 });
             });
         });
@@ -1379,26 +1781,12 @@ describe("MatrixClient", function () {
         const txnId = "m12345";
 
         const mockRoom = {
-            getMyMembership: () => "join",
+            getMyMembership: () => KnownMembership.Join,
             updatePendingEvent: (event: MatrixEvent, status: EventStatus) => event.setStatus(status),
-            currentState: {
-                getStateEvents: (eventType, stateKey) => {
-                    if (eventType === EventType.RoomCreate) {
-                        expect(stateKey).toEqual("");
-                        return new MatrixEvent({
-                            content: {
-                                [RoomCreateTypeField]: RoomType.Space,
-                            },
-                        });
-                    } else if (eventType === EventType.RoomEncryption) {
-                        expect(stateKey).toEqual("");
-                        return new MatrixEvent({ content: {} });
-                    } else {
-                        throw new Error("Unexpected event type or state key");
-                    }
-                },
-            } as Room["currentState"],
+            hasEncryptionStateEvent: jest.fn().mockReturnValue(true),
         } as unknown as Room;
+
+        let mockCrypto: Mocked<Crypto>;
 
         let event: MatrixEvent;
         beforeEach(async () => {
@@ -1414,11 +1802,12 @@ describe("MatrixClient", function () {
                 expect(getRoomId).toEqual(roomId);
                 return mockRoom;
             };
-            client.crypto = {
-                // mock crypto
-                encryptEvent: () => new Promise(() => {}),
+            mockCrypto = {
+                isEncryptionEnabledInRoom: jest.fn().mockResolvedValue(true),
+                encryptEvent: jest.fn(),
                 stop: jest.fn(),
-            } as unknown as Crypto;
+            } as unknown as Mocked<Crypto>;
+            client.crypto = client["cryptoBackend"] = mockCrypto;
         });
 
         function assertCancelled() {
@@ -1435,10 +1824,20 @@ describe("MatrixClient", function () {
         });
 
         it("should cancel an event which is encrypting", async () => {
+            const encryptEventDefer = defer();
+            mockCrypto.encryptEvent.mockReturnValue(encryptEventDefer.promise);
+
+            const statusPromise = testUtils.emitPromise(event, "Event.status");
             // @ts-ignore protected method access
-            client.encryptAndSendEvent(null, event);
-            await testUtils.emitPromise(event, "Event.status");
+            const encryptAndSendPromise = client.encryptAndSendEvent(mockRoom, event);
+            await statusPromise;
+            expect(event.status).toBe(EventStatus.ENCRYPTING);
             client.cancelPendingEvent(event);
+            assertCancelled();
+
+            // now let the encryption complete, and check that the message is not sent.
+            encryptEventDefer.resolve();
+            await encryptAndSendPromise;
             assertCancelled();
         });
 
@@ -1456,9 +1855,18 @@ describe("MatrixClient", function () {
     });
 
     describe("threads", () => {
+        it.each([
+            { startOpts: {}, hasThreadSupport: false },
+            { startOpts: { threadSupport: true }, hasThreadSupport: true },
+            { startOpts: { threadSupport: false }, hasThreadSupport: false },
+        ])("enabled thread support for the SDK instance", async ({ startOpts, hasThreadSupport }) => {
+            await client.startClient(startOpts);
+            expect(client.supportsThreads()).toBe(hasThreadSupport);
+        });
+
         it("partitions root events to room timeline and thread timeline", () => {
-            const supportsExperimentalThreads = client.supportsExperimentalThreads;
-            client.supportsExperimentalThreads = () => true;
+            const supportsThreads = client.supportsThreads;
+            client.supportsThreads = () => true;
             const room = new Room("!room1:matrix.org", client, userId);
 
             const rootEvent = new MatrixEvent({
@@ -1477,7 +1885,6 @@ describe("MatrixClient", function () {
                     },
                 },
                 event_id: "$ev1",
-                user_id: "@alice:matrix.org",
             });
 
             expect(rootEvent.isThreadRoot).toBe(true);
@@ -1487,7 +1894,7 @@ describe("MatrixClient", function () {
             expect(threadEvents).toHaveLength(1);
 
             // Restore method
-            client.supportsExperimentalThreads = supportsExperimentalThreads;
+            client.supportsThreads = supportsThreads;
         });
     });
 
@@ -2004,10 +2411,10 @@ describe("MatrixClient", function () {
             await client.ignoredInvites.addSource(NEW_SOURCE_ROOM_ID);
 
             // Add a rule in the new source room.
-            await client.sendStateEvent(NEW_SOURCE_ROOM_ID, PolicyScope.User, {
+            await client.sendStateEvent(NEW_SOURCE_ROOM_ID, EventType.PolicyRuleUser, {
                 entity: "*:example.org",
                 reason: "just a test",
-                recommendation: "m.ban",
+                recommendation: PolicyRecommendation.Ban,
             });
 
             // We should reject this invite.
@@ -2094,8 +2501,8 @@ describe("MatrixClient", function () {
             // Check where it shows up.
             const targetRoomId = ignoreInvites2.target;
             const targetRoom = client.getRoom(targetRoomId) as WrappedRoom;
-            expect(targetRoom._state.get(PolicyScope.User)[eventId]).toBeTruthy();
-            expect(newSourceRoom._state.get(PolicyScope.User)?.[eventId]).toBeFalsy();
+            expect(targetRoom._state.get(EventType.PolicyRuleUser)[eventId]).toBeTruthy();
+            expect(newSourceRoom._state.get(EventType.PolicyRuleUser)?.[eventId]).toBeFalsy();
         });
     });
 
@@ -2146,8 +2553,7 @@ describe("MatrixClient", function () {
                     "org.matrix.msc3391": true,
                 },
             };
-            jest.spyOn(client.http, "request").mockResolvedValue(versionsResponse);
-            const requestSpy = jest.spyOn(client.http, "authedRequest").mockImplementation(() => Promise.resolve());
+            const requestSpy = jest.spyOn(client.http, "authedRequest").mockResolvedValue(versionsResponse);
             const unstablePrefix = "/_matrix/client/unstable/org.matrix.msc3391";
             const path = `/user/${encodeURIComponent(userId)}/account_data/${eventType}`;
 
@@ -2185,8 +2591,7 @@ describe("MatrixClient", function () {
                     "org.matrix.msc3391": false,
                 },
             };
-            jest.spyOn(client.http, "request").mockResolvedValue(versionsResponse);
-            const requestSpy = jest.spyOn(client.http, "authedRequest").mockImplementation(() => Promise.resolve());
+            const requestSpy = jest.spyOn(client.http, "authedRequest").mockResolvedValue(versionsResponse);
             const path = `/user/${encodeURIComponent(userId)}/account_data/${eventType}`;
 
             // populate version support
@@ -2202,7 +2607,6 @@ describe("MatrixClient", function () {
         function roomCreateEvent(newRoomId: string, predecessorRoomId: string): MatrixEvent {
             return new MatrixEvent({
                 content: {
-                    "creator": "@daryl:alexandria.example.com",
                     "m.federate": true,
                     "predecessor": {
                         event_id: "id_of_last_event",
@@ -2234,7 +2638,78 @@ describe("MatrixClient", function () {
             });
         }
 
+        function predecessorEvent(newRoomId: string, predecessorRoomId: string): MatrixEvent {
+            return new MatrixEvent({
+                content: {
+                    predecessor_room_id: predecessorRoomId,
+                },
+                event_id: `predecessor_event_id_pred_${predecessorRoomId}`,
+                origin_server_ts: 1432735824653,
+                room_id: newRoomId,
+                sender: "@daryl:alexandria.example.com",
+                state_key: "",
+                type: "org.matrix.msc3946.room_predecessor",
+            });
+        }
+
         describe("getVisibleRooms", () => {
+            function setUpReplacedRooms(): {
+                room1: Room;
+                room2: Room;
+                replacedByCreate1: Room;
+                replacedByCreate2: Room;
+                replacedByDynamicPredecessor1: Room;
+                replacedByDynamicPredecessor2: Room;
+            } {
+                const room1 = new Room("room1", client, "@carol:alexandria.example.com");
+                const replacedByCreate1 = new Room("replacedByCreate1", client, "@carol:alexandria.example.com");
+                const replacedByCreate2 = new Room("replacedByCreate2", client, "@carol:alexandria.example.com");
+                const replacedByDynamicPredecessor1 = new Room("dyn1", client, "@carol:alexandria.example.com");
+                const replacedByDynamicPredecessor2 = new Room("dyn2", client, "@carol:alexandria.example.com");
+                const room2 = new Room("room2", client, "@daryl:alexandria.example.com");
+                client.store = new StubStore();
+                client.store.getRooms = () => [
+                    room1,
+                    replacedByCreate1,
+                    replacedByCreate2,
+                    replacedByDynamicPredecessor1,
+                    replacedByDynamicPredecessor2,
+                    room2,
+                ];
+                room1.addLiveEvents(
+                    [
+                        roomCreateEvent(room1.roomId, replacedByCreate1.roomId),
+                        predecessorEvent(room1.roomId, replacedByDynamicPredecessor1.roomId),
+                    ],
+                    {},
+                );
+                room2.addLiveEvents(
+                    [
+                        roomCreateEvent(room2.roomId, replacedByCreate2.roomId),
+                        predecessorEvent(room2.roomId, replacedByDynamicPredecessor2.roomId),
+                    ],
+                    {},
+                );
+                replacedByCreate1.addLiveEvents([tombstoneEvent(room1.roomId, replacedByCreate1.roomId)], {});
+                replacedByCreate2.addLiveEvents([tombstoneEvent(room2.roomId, replacedByCreate2.roomId)], {});
+                replacedByDynamicPredecessor1.addLiveEvents(
+                    [tombstoneEvent(room1.roomId, replacedByDynamicPredecessor1.roomId)],
+                    {},
+                );
+                replacedByDynamicPredecessor2.addLiveEvents(
+                    [tombstoneEvent(room2.roomId, replacedByDynamicPredecessor2.roomId)],
+                    {},
+                );
+
+                return {
+                    room1,
+                    room2,
+                    replacedByCreate1,
+                    replacedByCreate2,
+                    replacedByDynamicPredecessor1,
+                    replacedByDynamicPredecessor2,
+                };
+            }
             it("Returns an empty list if there are no rooms", () => {
                 client.store = new StubStore();
                 client.store.getRooms = () => [];
@@ -2275,6 +2750,57 @@ describe("MatrixClient", function () {
                 expect(rooms).toContain(room1);
                 expect(rooms).toContain(room2);
             });
+
+            it("Ignores m.predecessor if we don't ask to use it", () => {
+                // Given 6 rooms, 2 of which have been replaced, and 2 of which WERE
+                // replaced by create events, but are now NOT replaced, because an
+                // m.predecessor event has changed the room's predecessor.
+                const {
+                    room1,
+                    room2,
+                    replacedByCreate1,
+                    replacedByCreate2,
+                    replacedByDynamicPredecessor1,
+                    replacedByDynamicPredecessor2,
+                } = setUpReplacedRooms();
+
+                // When we ask for the visible rooms
+                const rooms = client.getVisibleRooms(); // Don't supply msc3946ProcessDynamicPredecessor
+
+                // Then we only get the ones that have not been replaced
+                expect(rooms).not.toContain(replacedByCreate1);
+                expect(rooms).not.toContain(replacedByCreate2);
+                expect(rooms).toContain(replacedByDynamicPredecessor1);
+                expect(rooms).toContain(replacedByDynamicPredecessor2);
+                expect(rooms).toContain(room1);
+                expect(rooms).toContain(room2);
+            });
+
+            it("Considers rooms replaced with m.predecessor events to be replaced", () => {
+                // Given 6 rooms, 2 of which have been replaced, and 2 of which WERE
+                // replaced by create events, but are now NOT replaced, because an
+                // m.predecessor event has changed the room's predecessor.
+                const {
+                    room1,
+                    room2,
+                    replacedByCreate1,
+                    replacedByCreate2,
+                    replacedByDynamicPredecessor1,
+                    replacedByDynamicPredecessor2,
+                } = setUpReplacedRooms();
+
+                // When we ask for the visible rooms
+                const useMsc3946 = true;
+                const rooms = client.getVisibleRooms(useMsc3946);
+
+                // Then we only get the ones that have not been replaced
+                expect(rooms).not.toContain(replacedByDynamicPredecessor1);
+                expect(rooms).not.toContain(replacedByDynamicPredecessor2);
+                expect(rooms).toContain(replacedByCreate1);
+                expect(rooms).toContain(replacedByCreate2);
+                expect(rooms).toContain(room1);
+                expect(rooms).toContain(room2);
+            });
         });
 
         describe("getRoomUpgradeHistory", () => {
@@ -2309,6 +2835,52 @@ describe("MatrixClient", function () {
                 });
 
                 return [room1, room2, room3, room4];
+            }
+
+            /**
+             * Creates 2 alternate chains of room history: one using create
+             * events, and one using MSC2946 predecessor+tombstone events.
+             *
+             * Using create, history looks like:
+             * room1->room2->room3->room4 (but note we do not create tombstones)
+             *
+             * Using predecessor+tombstone, history looks like:
+             * dynRoom1->dynRoom2->room3->dynRoom4->dynRoom4
+             *
+             * @returns [room1, room2, room3, room4, dynRoom1, dynRoom2,
+             *          dynRoom4, dynRoom5].
+             */
+            function createDynamicRoomHistory(): [Room, Room, Room, Room, Room, Room, Room, Room] {
+                // Don't create tombstones for the old versions - we generally
+                // expect only one tombstone in a room, and we are confused by
+                // anything else.
+                const creates = true;
+                const tombstones = false;
+                const [room1, room2, room3, room4] = createRoomHistory(creates, tombstones);
+                const dynRoom1 = new Room("dynRoom1", client, "@rick:grimes.example.com");
+                const dynRoom2 = new Room("dynRoom2", client, "@rick:grimes.example.com");
+                const dynRoom4 = new Room("dynRoom4", client, "@rick:grimes.example.com");
+                const dynRoom5 = new Room("dynRoom5", client, "@rick:grimes.example.com");
+
+                dynRoom1.addLiveEvents([tombstoneEvent(dynRoom2.roomId, dynRoom1.roomId)], {});
+                dynRoom2.addLiveEvents([predecessorEvent(dynRoom2.roomId, dynRoom1.roomId)]);
+
+                dynRoom2.addLiveEvents([tombstoneEvent(room3.roomId, dynRoom2.roomId)], {});
+                room3.addLiveEvents([predecessorEvent(room3.roomId, dynRoom2.roomId)]);
+
+                room3.addLiveEvents([tombstoneEvent(dynRoom4.roomId, room3.roomId)], {});
+                dynRoom4.addLiveEvents([predecessorEvent(dynRoom4.roomId, room3.roomId)]);
+
+                dynRoom4.addLiveEvents([tombstoneEvent(dynRoom5.roomId, dynRoom4.roomId)], {});
+                dynRoom5.addLiveEvents([predecessorEvent(dynRoom5.roomId, dynRoom4.roomId)]);
+
+                mocked(store.getRoom)
+                    .mockClear()
+                    .mockImplementation((roomId: string) => {
+                        return { room1, room2, room3, room4, dynRoom1, dynRoom2, dynRoom4, dynRoom5 }[roomId] || null;
+                    });
+
+                return [room1, room2, room3, room4, dynRoom1, dynRoom2, dynRoom4, dynRoom5];
             }
 
             it("Returns an empty list if room does not exist", () => {
@@ -2413,7 +2985,7 @@ describe("MatrixClient", function () {
                 expect(history.map((room) => room.roomId)).toEqual([room1.roomId]);
             });
 
-            it("Without verify links, includes predecessors that don't point forwards", () => {
+            it("Without verify links, includes successors that don't point backwards", () => {
                 // Given predecessors point forwards with tombstones, but
                 // successors do not point back with create events.
                 const [room1, room2, room3, room4] = createRoomHistory(false, true);
@@ -2453,6 +3025,380 @@ describe("MatrixClient", function () {
                     room4.roomId,
                 ]);
             });
+
+            it("Returns the predecessors and subsequent rooms using MSC3945 dynamic room predecessors", () => {
+                const [, , room3, , dynRoom1, dynRoom2, dynRoom4, dynRoom5] = createDynamicRoomHistory();
+                const useMsc3946 = true;
+                const verifyLinks = false;
+                const history = client.getRoomUpgradeHistory(room3.roomId, verifyLinks, useMsc3946);
+                expect(history.map((room) => room.roomId)).toEqual([
+                    dynRoom1.roomId,
+                    dynRoom2.roomId,
+                    room3.roomId,
+                    dynRoom4.roomId,
+                    dynRoom5.roomId,
+                ]);
+            });
+
+            it("When not asking for MSC3946, verified history without tombstones is empty", () => {
+                // There no tombstones to match the create events
+                const [, , room3] = createDynamicRoomHistory();
+                const useMsc3946 = false;
+                const verifyLinks = true;
+                const history = client.getRoomUpgradeHistory(room3.roomId, verifyLinks, useMsc3946);
+                // So we get no history back
+                expect(history.map((room) => room.roomId)).toEqual([room3.roomId]);
+            });
+        });
+    });
+
+    // these wrappers are deprecated, but we need coverage of them to pass the quality gate
+    describe("SecretStorage wrappers", () => {
+        let mockSecretStorage: Mocked<ServerSideSecretStorageImpl>;
+
+        beforeEach(() => {
+            mockSecretStorage = {
+                getDefaultKeyId: jest.fn(),
+                hasKey: jest.fn(),
+                isStored: jest.fn(),
+            } as unknown as Mocked<ServerSideSecretStorageImpl>;
+            client["_secretStorage"] = mockSecretStorage;
+        });
+
+        it("hasSecretStorageKey", async () => {
+            mockSecretStorage.hasKey.mockResolvedValue(false);
+            expect(await client.hasSecretStorageKey("mykey")).toBe(false);
+            expect(mockSecretStorage.hasKey).toHaveBeenCalledWith("mykey");
+        });
+
+        it("isSecretStored", async () => {
+            const mockResult = { key: {} as SecretStorageKeyDescriptionAesV1 };
+            mockSecretStorage.isStored.mockResolvedValue(mockResult);
+            expect(await client.isSecretStored("mysecret")).toBe(mockResult);
+            expect(mockSecretStorage.isStored).toHaveBeenCalledWith("mysecret");
+        });
+
+        it("getDefaultSecretStorageKeyId", async () => {
+            mockSecretStorage.getDefaultKeyId.mockResolvedValue("bzz");
+            expect(await client.getDefaultSecretStorageKeyId()).toEqual("bzz");
+        });
+
+        it("isKeyBackupKeyStored", async () => {
+            mockSecretStorage.isStored.mockResolvedValue(null);
+            expect(await client.isKeyBackupKeyStored()).toBe(null);
+            expect(mockSecretStorage.isStored).toHaveBeenCalledWith("m.megolm_backup.v1");
+        });
+    });
+
+    // these wrappers are deprecated, but we need coverage of them to pass the quality gate
+    describe("Crypto wrappers", () => {
+        describe("exception if no crypto", () => {
+            it("isCrossSigningReady", () => {
+                expect(() => client.isCrossSigningReady()).toThrow("End-to-end encryption disabled");
+            });
+
+            it("bootstrapCrossSigning", () => {
+                expect(() => client.bootstrapCrossSigning({})).toThrow("End-to-end encryption disabled");
+            });
+
+            it("isSecretStorageReady", () => {
+                expect(() => client.isSecretStorageReady()).toThrow("End-to-end encryption disabled");
+            });
+        });
+
+        describe("defer to crypto backend", () => {
+            let mockCryptoBackend: Mocked<CryptoBackend>;
+
+            beforeEach(() => {
+                mockCryptoBackend = {
+                    isCrossSigningReady: jest.fn(),
+                    bootstrapCrossSigning: jest.fn(),
+                    isSecretStorageReady: jest.fn(),
+                    stop: jest.fn().mockResolvedValue(undefined),
+                } as unknown as Mocked<CryptoBackend>;
+                client["cryptoBackend"] = mockCryptoBackend;
+            });
+
+            it("isCrossSigningReady", async () => {
+                const testResult = "test";
+                mockCryptoBackend.isCrossSigningReady.mockResolvedValue(testResult as unknown as boolean);
+                expect(await client.isCrossSigningReady()).toBe(testResult);
+                expect(mockCryptoBackend.isCrossSigningReady).toHaveBeenCalledTimes(1);
+            });
+
+            it("bootstrapCrossSigning", async () => {
+                const testOpts = {};
+                mockCryptoBackend.bootstrapCrossSigning.mockResolvedValue(undefined);
+                await client.bootstrapCrossSigning(testOpts);
+                expect(mockCryptoBackend.bootstrapCrossSigning).toHaveBeenCalledTimes(1);
+                expect(mockCryptoBackend.bootstrapCrossSigning).toHaveBeenCalledWith(testOpts);
+            });
+
+            it("isSecretStorageReady", async () => {
+                client["cryptoBackend"] = mockCryptoBackend;
+                const testResult = "test";
+                mockCryptoBackend.isSecretStorageReady.mockResolvedValue(testResult as unknown as boolean);
+                expect(await client.isSecretStorageReady()).toBe(testResult);
+                expect(mockCryptoBackend.isSecretStorageReady).toHaveBeenCalledTimes(1);
+            });
+        });
+    });
+
+    describe("paginateEventTimeline()", () => {
+        describe("notifications timeline", () => {
+            const unsafeNotification = {
+                actions: ["notify"],
+                room_id: "__proto__",
+                event: testUtils.mkMessage({
+                    user: "@villain:server.org",
+                    room: "!roomId:server.org",
+                    msg: "I am nefarious",
+                }),
+                profile_tag: null,
+                read: true,
+                ts: 12345,
+            };
+
+            const goodNotification = {
+                actions: ["notify"],
+                room_id: "!favouriteRoom:server.org",
+                event: new MatrixEvent({
+                    sender: "@bob:server.org",
+                    room_id: "!roomId:server.org",
+                    type: "m.call.invite",
+                    content: {},
+                }),
+                profile_tag: null,
+                read: true,
+                ts: 12345,
+            };
+
+            const highlightNotification = {
+                actions: ["notify", { set_tweak: "highlight", value: true }],
+                room_id: "!roomId:server.org",
+                event: testUtils.mkMessage({
+                    user: "@bob:server.org",
+                    room: "!roomId:server.org",
+                    msg: "I am highlighted banana",
+                }),
+                profile_tag: null,
+                read: true,
+                ts: 12345,
+            };
+
+            const setNotifsResponse = (notifications: any[] = []): void => {
+                const response: HttpLookup = {
+                    method: "GET",
+                    path: "/notifications",
+                    data: { notifications: JSON.parse(JSON.stringify(notifications)) },
+                };
+                httpLookups = [response];
+            };
+
+            const callRule: IPushRule = {
+                actions: [PushRuleActionName.Notify],
+                conditions: [
+                    {
+                        kind: ConditionKind.EventMatch,
+                        key: "type",
+                        pattern: "m.call.invite",
+                    },
+                ],
+                default: true,
+                enabled: true,
+                rule_id: ".m.rule.call",
+            };
+            const masterRule: IPushRule = {
+                actions: [PushRuleActionName.DontNotify],
+                conditions: [],
+                default: true,
+                enabled: false,
+                rule_id: RuleId.Master,
+            };
+            const bananaRule = {
+                actions: [PushRuleActionName.Notify, { set_tweak: TweakName.Highlight, value: true }],
+                pattern: "banana",
+                rule_id: "banana",
+                default: false,
+                enabled: true,
+            } as IPushRule;
+            const pushRules = {
+                global: {
+                    underride: [callRule],
+                    override: [masterRule],
+                    content: [bananaRule],
+                },
+            };
+
+            beforeEach(() => {
+                makeClient();
+
+                // this is how notif timeline is set up in react-sdk
+                const notifTimelineSet = new EventTimelineSet(undefined, {
+                    timelineSupport: true,
+                    pendingEvents: false,
+                });
+                notifTimelineSet.getLiveTimeline().setPaginationToken("", EventTimeline.BACKWARDS);
+                client.setNotifTimelineSet(notifTimelineSet);
+
+                setNotifsResponse();
+
+                client.setPushRules(pushRules);
+            });
+
+            it("should throw when trying to paginate forwards", async () => {
+                const timeline = client.getNotifTimelineSet()!.getLiveTimeline();
+                await expect(
+                    async () => await client.paginateEventTimeline(timeline, { backwards: false }),
+                ).rejects.toThrow("paginateNotifTimeline can only paginate backwards");
+            });
+
+            it("defaults limit to 30 events", async () => {
+                jest.spyOn(client.http, "authedRequest");
+                const timeline = client.getNotifTimelineSet()!.getLiveTimeline();
+                await client.paginateEventTimeline(timeline, { backwards: true });
+
+                expect(client.http.authedRequest).toHaveBeenCalledWith(Method.Get, "/notifications", {
+                    limit: "30",
+                    only: "highlight",
+                });
+            });
+
+            it("filters out unsafe notifications", async () => {
+                setNotifsResponse([unsafeNotification, goodNotification, highlightNotification]);
+
+                const timelineSet = client.getNotifTimelineSet()!;
+                const timeline = timelineSet.getLiveTimeline();
+                await client.paginateEventTimeline(timeline, { backwards: true });
+
+                // badNotification not added to timeline
+                const timelineEvents = timeline.getEvents();
+                expect(timelineEvents.length).toEqual(2);
+            });
+
+            it("sets push details on events and add to timeline", async () => {
+                setNotifsResponse([goodNotification, highlightNotification]);
+
+                const timelineSet = client.getNotifTimelineSet()!;
+                const timeline = timelineSet.getLiveTimeline();
+                await client.paginateEventTimeline(timeline, { backwards: true });
+
+                const [highlightEvent, goodEvent] = timeline.getEvents();
+                expect(highlightEvent.getPushActions()).toEqual({
+                    notify: true,
+                    tweaks: {
+                        highlight: true,
+                    },
+                });
+                expect(highlightEvent.getPushDetails().rule).toEqual({
+                    ...bananaRule,
+                    kind: "content",
+                });
+                expect(goodEvent.getPushActions()).toEqual({
+                    notify: true,
+                    tweaks: {
+                        highlight: false,
+                    },
+                });
+            });
+        });
+    });
+
+    describe("pushers", () => {
+        const pusher = {
+            app_id: "test",
+            app_display_name: "Test App",
+            data: {},
+            device_display_name: "test device",
+            kind: "http",
+            lang: "en-NZ",
+            pushkey: "1234",
+        };
+
+        beforeEach(() => {
+            makeClient();
+            const response: HttpLookup = {
+                method: Method.Post,
+                path: "/pushers/set",
+                data: {},
+            };
+            httpLookups = [response];
+            jest.spyOn(client.http, "authedRequest").mockClear();
+        });
+
+        it("should make correct request to set pusher", async () => {
+            const result = await client.setPusher(pusher);
+            expect(client.http.authedRequest).toHaveBeenCalledWith(Method.Post, "/pushers/set", undefined, pusher);
+            expect(result).toEqual({});
+        });
+
+        it("should make correct request to remove pusher", async () => {
+            const result = await client.removePusher(pusher.pushkey, pusher.app_id);
+            expect(client.http.authedRequest).toHaveBeenCalledWith(Method.Post, "/pushers/set", undefined, {
+                pushkey: pusher.pushkey,
+                app_id: pusher.app_id,
+                kind: null,
+            });
+            expect(result).toEqual({});
+        });
+    });
+
+    describe("getAuthIssuer", () => {
+        it("should use unstable prefix", async () => {
+            httpLookups = [
+                {
+                    method: "GET",
+                    path: `/auth_issuer`,
+                    data: {
+                        issuer: "https://issuer/",
+                    },
+                    prefix: "/_matrix/client/unstable/org.matrix.msc2965",
+                },
+            ];
+
+            await expect(client.getAuthIssuer()).resolves.toEqual({ issuer: "https://issuer/" });
+            expect(httpLookups.length).toEqual(0);
+        });
+    });
+
+    describe("identityHashedLookup", () => {
+        it("should return hashed lookup results", async () => {
+            const ID_ACCESS_TOKEN = "hello_id_server_please_let_me_make_a_request";
+
+            client.http.idServerRequest = jest.fn().mockImplementation((method, path, params) => {
+                if (method === "GET" && path === "/hash_details") {
+                    return { algorithms: ["sha256"], lookup_pepper: "carrot" };
+                } else if (method === "POST" && path === "/lookup") {
+                    return {
+                        mappings: {
+                            "WHA-MgrrsZACDI9F8OaVagpiyiV2sjZylGHJteT4OMU": "@bob:homeserver.dummy",
+                        },
+                    };
+                }
+
+                throw new Error("Test impl doesn't know about this request");
+            });
+
+            const lookupResult = await client.identityHashedLookup([["bob@email.dummy", "email"]], ID_ACCESS_TOKEN);
+
+            expect(client.http.idServerRequest).toHaveBeenCalledWith(
+                "GET",
+                "/hash_details",
+                undefined,
+                "/_matrix/identity/v2",
+                ID_ACCESS_TOKEN,
+            );
+
+            expect(client.http.idServerRequest).toHaveBeenCalledWith(
+                "POST",
+                "/lookup",
+                { pepper: "carrot", algorithm: "sha256", addresses: ["WHA-MgrrsZACDI9F8OaVagpiyiV2sjZylGHJteT4OMU"] },
+                "/_matrix/identity/v2",
+                ID_ACCESS_TOKEN,
+            );
+
+            expect(lookupResult).toHaveLength(1);
+            expect(lookupResult[0]).toEqual({ address: "bob@email.dummy", mxid: "@bob:homeserver.dummy" });
         });
     });
 });

@@ -12,7 +12,7 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - repo: vector-im/element-web
+                    - repo: element-hq/element-web
                       event: element-web-notify
                     - repo: matrix-org/matrix-react-sdk
                       event: upstream-sdk-notify
@@ -20,7 +20,7 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - name: Notify matrix-react-sdk repo that a new SDK build is on develop so it can CI against it
-              uses: peter-evans/repository-dispatch@v2
+              uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
               with:
                   token: ${{ secrets.ELEMENT_BOT_TOKEN }}
                   repository: ${{ matrix.repo }}
