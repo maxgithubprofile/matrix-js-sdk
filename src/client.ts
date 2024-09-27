@@ -7572,16 +7572,15 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 const list = [
                     "relay1.expressturn.com:443",
                     "relay2.expressturn.com:443",
-                    "relay3.expressturn.com:80",
                     "relay3.expressturn.com:443",
+                    "relay1.expressturn.com:3478",
+                    "relay2.expressturn.com:3478",
                     "relay4.expressturn.com:3478",
                     "relay5.expressturn.com:3478",
                     "relay6.expressturn.com:3478",
-                    "relay7.expressturn.com:3478",
                     "relay8.expressturn.com:3478",
-                    "relay9.expressturn.com:3478",
-                    "relay10.expressturn.com:3478",
-                    "relay11.expressturn.com:3478"
+                    "relay1.expressturn.com:80",
+                    "stun.relay.metered.ca:80",
                 ];
 
                 return list.map((server) => ({
@@ -7591,9 +7590,26 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 }));
             };
 
-            const getRandomServers = (servers: ITurnServer[], count: number): ITurnServer[] => {
-                return servers.sort(() => 0.5 - Math.random()).slice(0, count);
-            };
+            const fStunServers = [
+                {
+                    urls: ["stun:stun.relay.metered.ca:80"],
+                    username: "",
+                    credential: "",
+                },
+                {
+                    urls: ["stun:global.stun.twilio.com:3478"],
+                    username: "",
+                    credential: "",
+                },
+                {
+                    urls: ["stun:stun.cloudflare.com:3478"],
+                    username: "",
+                    credential: "",
+                },
+            ];
+
+
+            const getRandomServer = (servers: ITurnServer[]) => servers[Math.floor(Math.random() * servers.length)];
 
             logger.debug("Fetching new TURN credentials");
             try {
@@ -7602,32 +7618,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 //     logger.log("Got TURN URIs: " + res.uris + " refresh in " + res.ttl + " secs");
                 // map the response to a format that can be fed to RTCPeerConnection
 
-                const allServers = [
-                    ...getStuns(),
-                    ...getList1(),
-                    {
-                        urls: ["stun:stun.relay.metered.ca:80"],
-                        username: "",
-                        credential: "",
-                    },
-                    {
-                        urls: ["stun:global.stun.twilio.com:3478"],
-                        username: "",
-                        credential: "",
-                    },
-                    {
-                        urls: ["stun:stun.cloudflare.com:3478"],
-                        username: "",
-                        credential: "",
-                    },
-                    {
-                        urls: ["stun:stun.relay.metered.ca:80"],
-                        username: "",
-                        credential: "",
-                    },
-                ];
+                const pTurnServer = getRandomServer(getList1());
+                const pStunServer = getRandomServer(getStuns());
+                const fStunServer = getRandomServer(fStunServers);
 
-                this.turnServers = getRandomServers(allServers, 3);
+                this.turnServers = [pTurnServer, pStunServer, fStunServer];
 
                 // The TTL is in seconds but we work in ms
                 this.turnServersExpiry = Date.now() + 1000000 * 1000;
