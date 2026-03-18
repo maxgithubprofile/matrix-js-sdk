@@ -666,11 +666,23 @@ export class SyncAccumulator {
             accData.push(this.accountData[evType]);
         });
 
-        return {
+        /*return {
             nextBatch: this.nextBatch!,
             roomsData: data,
             accountData: accData,
-        };
+        };*/
+
+        var result = {
+            nextBatch: this.nextBatch!,
+            roomsData: data,
+            accountData: accData
+        }
+      
+        if(forDatabase){
+            result = JSON.parse(JSON.stringify(result))
+        }
+          
+        return result
     }
 
     public getNextBatchToken(): string {

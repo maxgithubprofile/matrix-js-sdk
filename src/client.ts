@@ -593,6 +593,7 @@ export interface ITurnServer {
     urls: string[];
     username: string;
     credential: string;
+    _type? : string
 }
 
 export interface IServerVersions {
@@ -7550,7 +7551,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             this.logger.debug("TURN creds are valid for another " + remainingTime + " ms: not fetching new ones.");
             credentialsGood = true;
         } else {
-            const getList1 = (): ITurnServer[] => {
+            /*const getList1 = (): ITurnServer[] => {
                 const list = [
                     "rel" + "ay2.expresstu" + "rn.com:443",
                     "rel" + "ay3.expresstu" + "rn.com:80",
@@ -7566,63 +7567,99 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     username: "efP" + "U52" + "K4S" + "LOQ" + "34W" + "2QY",
                     credential: "1TJ" + "PNF" + "xHK" + "XrZ" + "felz",
                 }));
-            };
+            };*/
 
             const getStuns = (): ITurnServer[] => {
                 const list = [
-                    "relay1.expressturn.com:443",
-                    "relay2.expressturn.com:443",
-                    "relay3.expressturn.com:443",
-                    "relay1.expressturn.com:3478",
-                    "relay2.expressturn.com:3478",
-                    "relay4.expressturn.com:3478",
-                    "relay5.expressturn.com:3478",
-                    "relay6.expressturn.com:3478",
-                    "relay8.expressturn.com:3478",
-                    "relay1.expressturn.com:80",
-                    "stun.relay.metered.ca:80",
+                    [
+                        "stun:relay1.expressturn.com:80",
+                        "stun:relay1.expressturn.com:443",
+                        "stun:relay1.expressturn.com:3478"
+                    ],
+                    ["stun:relay2.expressturn.com:3478"],
+                    ["stun:relay3.expressturn.com:3478"],
+                    ["stun:relay4.expressturn.com:3478"],
+                    ["stun:relay5.expressturn.com:3478"],
+                    ["stun:relay6.expressturn.com:3478"],
+                    ["stun:relay7.expressturn.com:3478"],
+                    ["stun:relay8.expressturn.com:3478"],
+                    ["stun:relay9.expressturn.com:3478"],
+                    ["stun:relay10.expressturn.com:3478"],
+                    ["stun:relay11.expressturn.com:3478"],
+                    ["stun:relay12.expressturn.com:3478"],
+                    ["stun:relay13.expressturn.com:3478"],
+                    ["stun:relay14.expressturn.com:3478"],
+                    ["stun:relay15.expressturn.com:3478"],
+                    ["stun:relay16.expressturn.com:3478"],
+                    ["stun:relay17.expressturn.com:3478"],
+                    ["stun:global.expressturn.com:3478"],
+                    ["stun:stun.relay.metered.ca:80"],
                 ];
 
                 return list.map((server) => ({
-                    urls: [`stun:${server}`],
+                    urls: server,
                     username: "",
                     credential: "",
+                    _type : 'stun'
                 }));
             };
 
-            const fStunServers = [
+            const fStunServers: ITurnServer[] = [
                 {
                     urls: ["stun:stun.relay.metered.ca:80"],
                     username: "",
                     credential: "",
+                    _type : 'stunGlobal'
                 },
                 {
                     urls: ["stun:global.stun.twilio.com:3478"],
                     username: "",
                     credential: "",
+                    _type : 'stunGlobal'
                 },
                 {
                     urls: ["stun:stun.cloudflare.com:3478"],
                     username: "",
                     credential: "",
+                    _type : 'stunGlobal'
                 },
             ];
 
-
-            const getRandomServer = (servers: ITurnServer[]) => servers[Math.floor(Math.random() * servers.length)];
-
             logger.debug("Fetching new TURN credentials");
             try {
-                // const res = await this.turnServer();
-                // if (res.uris) {
+
+
+                
                 //     logger.log("Got TURN URIs: " + res.uris + " refresh in " + res.ttl + " secs");
                 // map the response to a format that can be fed to RTCPeerConnection
 
-                const pTurnServer = getRandomServer(getList1());
-                const pStunServer = getRandomServer(getStuns());
-                const fStunServer = getRandomServer(fStunServers);
+                //const pTurnServer = getRandomServer(getList1());
 
-                this.turnServers = [pTurnServer, pStunServer, fStunServer];
+                this.turnServers = [...getStuns(), ...fStunServers];
+
+                const res = await this.turnServer();
+                if (res.uris) {
+                    /*const servers: ITurnServer = {
+                        urls: res.uris,
+                        username: res.username,
+                        credential: res.password,
+                        _type : 'turn'
+                    };*/
+
+                    res.uris.forEach(u => {
+                        const server: ITurnServer = {
+                            urls: [u],
+                            username: res.username,
+                            credential: res.password,
+                            _type : 'turn'
+                        };
+
+                        this.turnServers.push(server)
+                    })
+
+
+                    
+                }
 
                 // The TTL is in seconds but we work in ms
                 this.turnServersExpiry = Date.now() + 1000000 * 1000;

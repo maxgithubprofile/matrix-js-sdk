@@ -76,9 +76,12 @@ interface CallOpts {
 interface TurnServer {
     urls: Array<string>;
     username?: string;
-    password?: string;
+    credential?: string;
     ttl?: number;
+    _type? : string
 }
+
+
 
 interface AssertedIdentity {
     id: string;
@@ -969,7 +972,7 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
             );
         }
 
-        this.peerConn = this.createPeerConnection();
+        this.peerConn = this.createPeerConnection(this.callId);
         this.emit(CallEvent.PeerConnectionCreated, this.peerConn, this);
         // we must set the party ID before await-ing on anything: the call event
         // handler will start giving us more call events (eg. candidates) so if
@@ -2885,15 +2888,59 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
 
         // create the peer connection now so it can be gathering candidates while we get user
         // media (assuming a candidate pool size is configured)
-        this.peerConn = this.createPeerConnection();
+        this.peerConn = this.createPeerConnection(this.callId);
         this.emit(CallEvent.PeerConnectionCreated, this.peerConn, this);
         this.gotCallFeedsForInvite(callFeeds, requestScreenshareFeed);
     }
 
-    private createPeerConnection(): RTCPeerConnection {
+    private pickServersForId(servers: TurnServer[], id: string): TurnServer[] {
+        function hashCode(str: string): number {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) {
+            hash = (hash << 5) - hash + str.charCodeAt(i);
+            hash |= 0; // 32-бит
+            }
+            return Math.abs(hash);
+        }
+
+        function seededShuffle<T>(array: T[], seed: number): T[] {
+            const result = array.slice();
+            let m = result.length;
+            while (m) {
+            const i = Math.floor(random(seed++) * m--);
+            [result[m], result[i]] = [result[i], result[m]];
+            }
+            return result;
+        }
+
+        function random(seed: number): number {
+            const x = Math.sin(seed) * 10000;
+            return x - Math.floor(x);
+        }
+
+        const seed = hashCode(id);
+
+        const turns = servers.filter(s => s._type === 'turn');
+        const stuns = servers.filter(s => s._type === 'stun');
+        const stunGlobals = servers.filter(s => s._type === 'stunGlobal');
+
+        const pickTurn = seededShuffle(turns, seed).slice(0, Math.min(2, turns.length));
+        const pickStun = seededShuffle(stuns, seed + 1).slice(0, Math.min(2, stuns.length));
+        const pickStunGlobal = seededShuffle(stunGlobals, seed + 2).slice(0, Math.min(1, stunGlobals.length));
+
+        return [...pickTurn, ...pickStun, ...pickStunGlobal];
+    }
+
+    private createPeerConnection(callId: string): RTCPeerConnection {
+
+        const iceServers: TurnServer[] | undefined = this.turnServers.length ? this.pickServersForId(this.turnServers, callId) : undefined
+
+        console.log('iceServers for id', iceServers, callId)
+        console.log('iceServers for id', this.turnServers, callId)
+
         const pc = new window.RTCPeerConnection({
             iceTransportPolicy: this.forceTURN ? "relay" : undefined,
-            iceServers: this.turnServers.length ? this.turnServers : undefined,
+            iceServers: iceServers,
             iceCandidatePoolSize: this.client.iceCandidatePoolSize,
             bundlePolicy: "max-bundle",
         });
