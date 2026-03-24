@@ -6903,7 +6903,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @returns Promise which resolves: As requestEmailToken
      */
 
-    
+
     public requestRegisterEmailToken(
         email: string,
         clientSecret: string,
@@ -7571,11 +7571,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
 
             const getStuns = (): ITurnServer[] => {
                 const list = [
-                    [
-                        "stun:relay1.expressturn.com:80",
-                        "stun:relay1.expressturn.com:443",
-                        "stun:relay1.expressturn.com:3478"
-                    ],
+                    ["stun:relay1.expressturn.com:3478"],
                     ["stun:relay2.expressturn.com:3478"],
                     ["stun:relay3.expressturn.com:3478"],
                     ["stun:relay4.expressturn.com:3478"],
@@ -7592,6 +7588,8 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     ["stun:relay15.expressturn.com:3478"],
                     ["stun:relay16.expressturn.com:3478"],
                     ["stun:relay17.expressturn.com:3478"],
+                    ["stun:relay18.expressturn.com:3478"],
+                    ["stun:relay19.expressturn.com:3478"],
                     ["stun:global.expressturn.com:3478"],
                     ["stun:stun.relay.metered.ca:80"],
                 ];
@@ -7629,7 +7627,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             try {
 
 
-                
+
                 //     logger.log("Got TURN URIs: " + res.uris + " refresh in " + res.ttl + " secs");
                 // map the response to a format that can be fed to RTCPeerConnection
 
@@ -7658,11 +7656,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     })
 
 
-                    
+
                 }
 
                 // The TTL is in seconds but we work in ms
-                this.turnServersExpiry = Date.now() + 1000000 * 1000;
+                this.turnServersExpiry = Date.now() + res.ttl * 1000;
                 credentialsGood = true;
                 this.emit(ClientEvent.TurnServers, this.turnServers);
                 // }
