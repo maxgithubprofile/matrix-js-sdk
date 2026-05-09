@@ -78,10 +78,8 @@ interface TurnServer {
     username?: string;
     credential?: string;
     ttl?: number;
-    _type? : string
+    _type?: string;
 }
-
-
 
 interface AssertedIdentity {
     id: string;
@@ -2920,23 +2918,35 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
 
         const seed = hashCode(id);
 
-        const turns = servers.filter(s => s._type === 'turn');
-        const stuns = servers.filter(s => s._type === 'stun');
-        const stunGlobals = servers.filter(s => s._type === 'stunGlobal');
+        const turnsUDP = servers.filter((s) =>
+            s._type === "turn" &&
+            !s.urls[0]?.endsWith("transport=tcp"));
+        const turnsTCP443 = servers.filter((s) =>
+            s._type === "turn" &&
+            s.urls[0]?.endsWith(":443?transport=tcp"));
+        const turnsTCP = servers.filter((s) =>
+                s._type === "turn" &&
+                s.urls[0]?.endsWith("transport=tcp") &&
+                !s.urls[0]?.endsWith(":443?transport=tcp"),
+        );
+        const stuns = servers.filter((s) => s._type === 'stun');
+        const stunGlobals = servers.filter((s) => s._type === 'stunGlobal');
 
-        const pickTurn = seededShuffle(turns, seed).slice(0, Math.min(2, turns.length));
-        const pickStun = seededShuffle(stuns, seed + 1).slice(0, Math.min(2, stuns.length));
-        const pickStunGlobal = seededShuffle(stunGlobals, seed + 2).slice(0, Math.min(1, stunGlobals.length));
+        const pickTurnUDP = seededShuffle(turnsUDP, seed).slice(0, Math.min(2, turnsUDP.length));
+        const pickTurnTCP443 = seededShuffle(turnsTCP443, seed + 1).slice(0, Math.min(2, turnsTCP443.length));
+        const pickTurnTCP = seededShuffle(turnsTCP, seed + 2).slice(0, Math.min(2, turnsTCP.length));
+        const pickStun = seededShuffle(stuns, seed + 3).slice(0, Math.min(2, stuns.length));
+        const pickStunGlobal = seededShuffle(stunGlobals, seed + 4).slice(0, Math.min(1, stunGlobals.length));
 
-        return [...pickTurn, ...pickStun, ...pickStunGlobal];
+        return [...pickStun, ...pickStunGlobal, ...pickTurnTCP443, ...pickTurnTCP, ...pickTurnUDP];
     }
 
     private createPeerConnection(callId: string): RTCPeerConnection {
 
-        const iceServers: TurnServer[] | undefined = this.turnServers.length ? this.pickServersForId(this.turnServers, callId) : undefined
+        const iceServers: TurnServer[] | undefined = this.turnServers.length ? this.pickServersForId(this.turnServers, callId) : undefined;
 
-        console.log('iceServers for id', iceServers, callId)
-        console.log('iceServers for id', this.turnServers, callId)
+        console.log('iceServers for id', iceServers, callId);
+        console.log('iceServers for id', this.turnServers, callId);
 
         const pc = new window.RTCPeerConnection({
             iceTransportPolicy: this.forceTURN ? "relay" : undefined,
